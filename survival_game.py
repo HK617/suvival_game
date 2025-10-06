@@ -402,18 +402,22 @@ def world_to_tile(wx: float, wy: float, tile_w: int = None, tile_h: int = None):
 
 # ==== 全体マップ =====
 def enter_minimap():
-    global overlooking, TILE_W, TILE_H, bg_ctx, LABEL_GRID_CACHE
+    """縮小マップ表示へ切り替え（再ビルドなし）"""
+    global overlooking, TILE_W, TILE_H, bg_ctx, minimap_cam_x, minimap_cam_y
     overlooking = True
+    minimap_cam_x = 0.0
+    minimap_cam_y = 0.0
     TILE_W, TILE_H = MINIMAP_TILE_W, MINIMAP_TILE_H
     bg_ctx = bg_ctx_mini
-    LABEL_GRID_CACHE.clear()
 
 def exit_minimap():
-    global overlooking, TILE_W, TILE_H, bg_ctx, LABEL_GRID_CACHE
+    """縮小マップ表示を解除（再ビルドなし）"""
+    global overlooking, TILE_W, TILE_H, bg_ctx, minimap_cam_x, minimap_cam_y
     overlooking = False
+    minimap_cam_x = 0.0
+    minimap_cam_y = 0.0
     TILE_W, TILE_H = NORMAL_TILE_W, NORMAL_TILE_H
     bg_ctx = bg_ctx_normal
-    LABEL_GRID_CACHE.clear()
 
 # 旧: def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th):
 def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th,
@@ -450,6 +454,36 @@ def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th,
             pygame.draw.rect(surf, (0, 0, 0), (x, y, tw, th), 1)
 
     return surf
+
+# ===== ミニマップズーム設定 =====
+MINIMAP_ZOOM_SIZES = [50, 75, 100, 150, 200, 300]  # 1タイルのピクセルサイズ候補
+minimap_zoom_i = MINIMAP_ZOOM_SIZES.index(100)     # 既定=100px/タイル
+
+# ズームごとの背景コンテキストをキャッシュ
+MINIMAP_CTXS = {}
+
+def set_minimap_zoom_index(new_i: int):
+    """ズームインデックスを反映して、TILE_W/H と bg_ctx を切替"""
+    global minimap_zoom_i, TILE_W, TILE_H, bg_ctx, LABEL_GRID_CACHE
+    minimap_zoom_i = max(0, min(len(MINIMAP_ZOOM_SIZES) - 1, new_i))
+    size = MINIMAP_ZOOM_SIZES[minimap_zoom_i]
+
+    # コンテキストが無ければ生成してキャッシュ
+    if size not in MINIMAP_CTXS:
+        MINIMAP_CTXS[size] = prepare_bg(BG_TILES, size, size)
+
+    # このフレームから使う解像度に切替
+    TILE_W = TILE_H = size
+    bg_ctx = MINIMAP_CTXS[size]
+
+    # ラベルレイヤーはサイズ依存なのでクリア
+    LABEL_GRID_CACHE.clear()
+
+# ==== マップ移動 ======
+# ===== ミニマップ手動パン =====
+MINIMAP_PAN_SPEED_PX = 12   # 1フレームの移動量（Shiftで×3）
+minimap_cam_x = 0.0         # ミニマップ内カメラのXオフセット（px）
+minimap_cam_y = 0.0         # ミニマップ内カメラのYオフセット（px）
 
 
 def draw_game(screen):
@@ -1089,22 +1123,19 @@ NORMAL_TILE_W, NORMAL_TILE_H = 10000, 10000
 MINIMAP_TILE_W, MINIMAP_TILE_H = 100, 100
 BG_TILES = [("bg1.png", 6), ("bg2.png", 3), ("bg3.png", 1)]
 BG_RANDOM_SEED = 1337
-# 追加：通常タイル/ミニマップ用タイルの定数（既に定義済みなら流用）
-NORMAL_TILE_W, NORMAL_TILE_H = 10000, 10000
-MINIMAP_TILE_W, MINIMAP_TILE_H = 100, 100
-BG_TILES = [("bg1.png", 6), ("bg2.png", 3), ("bg3.png", 1)]
-BG_RANDOM_SEED = 1337
 
-# ← ここを変更：最初に両方ビルドしておく（1回きり）
+# 背景コンテキストの生成（その後でOK）
 bg_ctx_normal = prepare_bg(BG_TILES, NORMAL_TILE_W, NORMAL_TILE_H)
 bg_ctx_mini   = prepare_bg(BG_TILES, MINIMAP_TILE_W, MINIMAP_TILE_H)
-bg_ctx = bg_ctx_normal  # 現在の参照を通常用に
-# 任意：初回に軽くタイルキャッシュを温める
+bg_ctx = bg_ctx_normal
+
+MINIMAP_CTXS[100] = bg_ctx_mini
+
+# （任意）初回ウォームアップ
 _tmp = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
 draw_bg(_tmp, bg_ctx_normal, 0, 0, BG_RANDOM_SEED)
 draw_bg(_tmp, bg_ctx_mini,   0, 0, BG_RANDOM_SEED)
 del _tmp
-
 # -----------------------------
 # Power Up のコスト設定
 # -----------------------------
@@ -1385,70 +1416,88 @@ while running:
 
     if not game_over and not game_clear:
         if paused:
-            # --- イベント処理（pause中もキーを受け付ける） ---
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
 
-                elif event.type == pygame.KEYDOWN:
-                    # レベルアップ選択待ち中は、F/ESCを優先して処理
+                # ===== ミニマップ（俯瞰）中の入力 =====
+                if overlooking:
+                    if event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_o, pygame.K_ESCAPE, pygame.K_p):
+                            exit_minimap()
+                            paused = False
+                            continue
+                        # ズームイン / ズームアウト（＋／−、テンキー対応）
+                        if event.key in (pygame.K_EQUALS, pygame.K_UP):
+                            set_minimap_zoom_index(minimap_zoom_i + 1)
+                            continue
+                        if event.key in (pygame.K_MINUS, pygame.K_DOWN):
+                            set_minimap_zoom_index(minimap_zoom_i - 1)
+                            continue
+                    elif event.type == pygame.MOUSEWHEEL:
+                        if event.y > 0:
+                            set_minimap_zoom_index(minimap_zoom_i + 1)
+                        elif event.y < 0:
+                            set_minimap_zoom_index(minimap_zoom_i - 1)
+                    # === ここを追加：W/A/S/D でミニマップ内をパン ===
+                    keys = pygame.key.get_pressed()
+                    spd = MINIMAP_PAN_SPEED_PX
+                    if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+                        spd *= 3  # Shiftで高速パン
+
+                    if keys[pygame.K_w]:
+                        minimap_cam_y -= spd
+                    if keys[pygame.K_s]:
+                        minimap_cam_y += spd
+                    if keys[pygame.K_a]:
+                        minimap_cam_x -= spd
+                    if keys[pygame.K_d]:
+                        minimap_cam_x += spd
+                    # 俯瞰中は通常pause処理に進まない
+                    continue
+
+                # ===== ここから通常の pause 中キー処理 =====
+                if event.type == pygame.KEYDOWN:
+                    # レベルアップ説明モーダル中の決定/キャンセル
                     if level_up_pending and choice_waiting:
                         if event.key == pygame.K_f and selected_choice_idx is not None:
                             choice_id = current_level_choices[selected_choice_idx]
                             level_up(choice_id)
                             choice_waiting = False
                             selected_choice_idx = None
-                            # レベルアップ確定後もポーズ継続でOK（必要なら paused=False にしても良い）
                             continue
                         elif event.key == pygame.K_ESCAPE:
-                            # 選択のキャンセル（ポーズは維持）
                             choice_waiting = False
                             selected_choice_idx = None
                             continue
-                        # --- ミニマップ中の終了操作（優先的に処理）---
-                    if overlooking and (event.key == pygame.K_o or event.key == pygame.K_ESCAPE or event.key == pygame.K_p):
-                        exit_minimap()
-                        paused = False           # そのままゲーム再開
-                        continue
 
-                    # ↑待ち中ではない通常のキー
-                    if event.key == pygame.K_ESCAPE:
+                    # 通常のpause解除
+                    if event.key in (pygame.K_ESCAPE, pygame.K_p):
                         paused = False
-                    elif event.key == pygame.K_p:
-                        paused = False
-                
+
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if level_up_pending:
                         rects = get_level_choice_rects()
-
                         if not choice_waiting:
-                            # まだ説明モーダルを出していない：選択肢クリックで説明を開く
                             for idx, r in enumerate(rects):
                                 if r.collidepoint(event.pos):
                                     choice_waiting = True
                                     selected_choice_idx = idx
                                     break
                         else:
-                            # 説明モーダル表示中（choice_waiting == True）
                             clicked_any = False
                             for idx, r in enumerate(rects):
                                 if r.collidepoint(event.pos):
                                     clicked_any = True
                                     if idx == selected_choice_idx:
-                                        # 同じ選択肢をもう一回クリック → 確定
                                         choice_id = current_level_choices[selected_choice_idx]
                                         level_up(choice_id)
                                         choice_waiting = False
                                         selected_choice_idx = None
-                                        # （必要なら）ポーズを閉じたければ下を有効化
-                                        # paused = False
                                     else:
-                                        # 別の選択肢をクリック → 説明を切替
                                         selected_choice_idx = idx
                                     break
-
                             if not clicked_any:
-                                # モーダルの外側クリックで閉じる（モーダル内なら何もしない）
                                 box_w, box_h = 560, 280
                                 box_rect = pygame.Rect(
                                     SCREEN_WIDTH // 2 - box_w // 2,
@@ -1461,6 +1510,7 @@ while running:
 
             # ===== 俯瞰モード（背景＋スポーン基準タイル座標ラベル＋player.png） =====
             if overlooking:
+            
                 # ミニマップ時は TILE_W/H = 100,100 の想定
                 tw, th = TILE_W, TILE_H
 
@@ -1475,8 +1525,8 @@ while running:
                 pan_x = (player_x - SPAWN_CENTER_WX) / 50000.0
                 pan_y = (player_y - SPAWN_CENTER_WY) / 50000.0
 
-                bg_off_x = int(tile_lx - (SCREEN_WIDTH  // 2) - pan_x)
-                bg_off_y = int(tile_ly - (SCREEN_HEIGHT // 2) - pan_y)
+                bg_off_x = int(tile_lx - (SCREEN_WIDTH  // 2) - pan_x + minimap_cam_x)
+                bg_off_y = int(tile_ly - (SCREEN_HEIGHT // 2) - pan_y + minimap_cam_y)
 
                 # 背景のみ描画
                 draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
@@ -1560,6 +1610,10 @@ while running:
                 hint_font = jp_font(22)
                 hint = hint_font.render("O または ESC で閉じる", True, (0, 0, 0))
                 screen.blit(hint, (20, 20))
+
+                zfont = jp_font(16)
+                zoom_info = zfont.render(f"Zoom: {TILE_W}px/tile", True, (0,0,0))
+                screen.blit(zoom_info, (20, 48))
 
                 pygame.display.flip()
                 clock.tick(60)
