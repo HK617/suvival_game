@@ -208,57 +208,85 @@ def load_game_data():
     global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
     global BG_RANDOM_SEED, EXPLORED_TILES
 
+    # まずは安全なデフォルト（上で定義済みだが、明示再設定しておくと安心）
+    pad, psp, pmh, pexp, bat = 1, 5, 10, 1, 0
+    seed_default = BG_RANDOM_SEED
+
     if os.path.exists(SAVE_FILE):
-        with open(SAVE_FILE, 'r') as f:
+        with open(SAVE_FILE, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
-                persistent_attack_bonus = data.get("persistent_attack_bonus", 0)
-                persistent_speed_bonus  = data.get("persistent_speed_bonus", 0)
-                persistent_maxhp_bonus  = data.get("persistent_maxhp_bonus", 0)
-                persistent_exp_bonus    = data.get("persistent_exp_bonus", 0)
-                battery                 = data.get("battery", 0)
 
-                old_seed = BG_RANDOM_SEED
-                new_seed = data.get("bg_seed", old_seed)
-                BG_RANDOM_SEED = new_seed
+                persistent_attack_bonus = int(data.get("persistent_attack_bonus", pad))
+                persistent_speed_bonus  = int(data.get("persistent_speed_bonus",  psp))
+                persistent_maxhp_bonus  = int(data.get("persistent_maxhp_bonus",  pmh))
+                persistent_exp_bonus    = float(data.get("persistent_exp_bonus",  pexp))
+                battery                 = int(data.get("battery",                  bat))
 
-                # 探索履歴
-                tiles = data.get("explored_tiles", [])
-                EXPLORED_TILES = set((int(gx), int(gy)) for gx, gy in tiles if isinstance(gx, int) or isinstance(gy, int))
+                # シード
+                BG_RANDOM_SEED = int(data.get("bg_seed", seed_default))
 
-                # シードが変わったなら全キャッシュ掃除
-                if new_seed != old_seed:
-                    clear_all_bg_caches()
+                # explored_tiles は新旧両対応
+                explored_data = data.get("explored_tiles", "")
+                EXPLORED_TILES = set()
+                if isinstance(explored_data, str):
+                    for token in explored_data.split(";"):
+                        token = token.strip()
+                        if not token: 
+                            continue
+                        gx_str, gy_str = token.split(",")
+                        EXPLORED_TILES.add((int(gx_str), int(gy_str)))
+                elif isinstance(explored_data, list):
+                    for pair in explored_data:
+                        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                            gx, gy = pair
+                            EXPLORED_TILES.add((int(gx), int(gy)))
 
                 print("セーブデータを読み込みました。")
+
             except json.JSONDecodeError:
-                print("セーブファイルの読み込みに失敗しました。初期値を使用します。")
-                persistent_attack_bonus = persistent_speed_bonus = persistent_maxhp_bonus = persistent_exp_bonus = 0
-                battery = 0
+                # 空ファイル/壊れたJSON → 完全初期化
+                persistent_attack_bonus = pad
+                persistent_speed_bonus  = psp
+                persistent_maxhp_bonus  = pmh
+                persistent_exp_bonus    = pexp
+                battery                 = bat
+                BG_RANDOM_SEED          = seed_default
+                EXPLORED_TILES          = set()
+                print("セーブファイルが壊れています。初期値で続行します。")
     else:
-        print("セーブファイルが見つかりません。初期値を使用します。")
-        persistent_attack_bonus = persistent_speed_bonus = persistent_maxhp_bonus = persistent_exp_bonus = 0
-        battery = 0
+        # ファイルが無い → 初期値
+        persistent_attack_bonus = pad
+        persistent_speed_bonus  = psp
+        persistent_maxhp_bonus  = pmh
+        persistent_exp_bonus    = pexp
+        battery                 = bat
+        BG_RANDOM_SEED          = seed_default
+        EXPLORED_TILES          = set()
+        print("セーブファイルが見つかりません。初期値で開始します。")
 
 
 # ===============================
 # セーブデータの保存
 # ===============================
 def save_game_data():
+    # 探索済みを "gx,gy;gx,gy;..." の文字列に変換
+    explored_str = ";".join(f"{gx},{gy}" for gx, gy in EXPLORED_TILES)
+
     data = {
         "persistent_attack_bonus": persistent_attack_bonus,
         "persistent_speed_bonus": persistent_speed_bonus,
         "persistent_maxhp_bonus": persistent_maxhp_bonus,
-        "persistent_exp_bonus" : persistent_exp_bonus,
+        "persistent_exp_bonus": persistent_exp_bonus,
         "battery": battery,
-
-        #マップデータ
         "bg_seed": BG_RANDOM_SEED,
-        "explored_tiles": list(EXPLORED_TILES),  # 例: [[0,0],[1,0],...]
+        # ★ 短く保存
+        "explored_tiles": explored_str,
     }
-    with open(SAVE_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
-    print("セーブデータを保存しました。")
+
+    with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+        print("セーブデータを保存しました。")
 
 # ===============================
 # セーブデータの削除
@@ -1572,6 +1600,17 @@ while running:
 
                 # 背景のみ描画
                 draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
+
+                # === 探索済みタイルを薄く塗る ===
+                overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                for gx, gy in EXPLORED_TILES:
+                    # タイル左上の座標を算出（背景と同じロジック）
+                    tile_screen_x = gx * TILE_W - bg_off_x
+                    tile_screen_y = gy * TILE_H - bg_off_y
+                    # 半透明の矩形を描く
+                    pygame.draw.rect(overlay, (0, 255, 0, 80), (tile_screen_x, tile_screen_y, TILE_W, TILE_H))
+                # まとめて描画
+                screen.blit(overlay, (0, 0))
 
                 # 4) 画面に見えている“描画タイル”のインデックス（divmodで安定化）
                 qx, rx = divmod(int(bg_off_x), tw)   # qx = base_gx,  rx = 0..tw-1
