@@ -139,6 +139,11 @@ player_image = player_original
 PLAYER_DRAW_X = SCREEN_WIDTH // 2 - player_original.get_width() // 2
 PLAYER_DRAW_Y = SCREEN_HEIGHT // 2 - player_original.get_height() // 2
 
+# ミニマップ用のプレイヤーアイコン
+MINIMAP_ICON_PX = 16  # お好みで 12〜24 あたり
+player_icon_img = pygame.image.load("player_icon.png").convert_alpha()
+player_icon = pygame.transform.smoothscale(player_icon_img, (MINIMAP_ICON_PX, MINIMAP_ICON_PX))
+
 # 敵画像
 enemy_image = pygame.image.load("SG_enemy(level1).png").convert_alpha()
 enemy_image = pygame.transform.scale(enemy_image, (30, 30))
@@ -1461,10 +1466,38 @@ while running:
                         x += tw; gx_iter += 1
                     y += th; gy_iter += 1
 
-                # プレイヤーはタイル中心に固定表示（player.png）
-                px = SCREEN_WIDTH  // 2 + tw // 2 - player_original.get_width()  // 2
-                py = SCREEN_HEIGHT // 2 + th // 2 - player_original.get_height() // 2
-                screen.blit(player_original, (px, py))
+                # --- プレイヤーアイコンを「そのタイル内の実位置」に置く ---
+                # いま描いているタイル解像度（ミニマップ時は tw=th=100）
+                scale_px_per_world = tw / 10000.0  # 10000ワールド単位 → twピクセル
+
+                # プレイヤーがいるスポーン基準タイル番号（すでに lgx, lgy があります）
+                # lgx, lgy = spawn_rel_tile(player_x, player_y) は上で計算済み
+
+                # そのタイルの「左上」が画面上のどこか（bg_off_x/y を使って直接求める）
+                tile_screen_x = lgx * tw - bg_off_x
+                tile_screen_y = lgy * th - bg_off_y
+
+                # スポーン中心からの相対距離（ワールド単位）
+                dx = player_x - SPAWN_CENTER_WX
+                dy = player_y - SPAWN_CENTER_WY
+
+                # タイル内オフセット（0〜10000）：
+                # 左端 = -5000 + 10000*lgx なので、残差 = delta - 左端
+                rx_world = dx + 5000 - 10000 * lgx
+                ry_world = dy + 5000 - 10000 * lgy
+                # 念のためはみ出し防止（四捨五入誤差対策）
+                rx_world = max(0, min(9999, rx_world))
+                ry_world = max(0, min(9999, ry_world))
+
+                # ピクセルに変換（ミニマップのタイル内位置）
+                off_x_px = int(rx_world * scale_px_per_world)
+                off_y_px = int(ry_world * scale_px_per_world)
+
+                # 画面上の実描画位置（アイコンの中心を載せたいので半分引く）
+                icon_x = int(tile_screen_x + off_x_px - player_icon.get_width()  / 2)
+                icon_y = int(tile_screen_y + off_y_px - player_icon.get_height() / 2)
+
+                screen.blit(player_icon, (icon_x, icon_y))
 
                 # ヒント
                 hint_font = jp_font(22)
