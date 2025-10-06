@@ -270,167 +270,162 @@ def draw_tiled_bg(surface, texture, offset_x, offset_y):
             surface.blit(texture, (x, y))
             y += th
         x += tw
-        
-def center_of_tile(gx, gy):
-    return gx * TILE_W + TILE_W // 2, gy * TILE_H + TILE_H // 2
-        
-# --- 俯瞰トグル用のフラグ（未定義なら追加） ---
-overlooking = False
 
-# --- 背景タイルの設定（出現率） ---
-BG_TILES = [
-    ("bg1.png", 6),  # よく出す
-    ("bg2.png", 3),  # 普通
-    ("bg3.png", 1),  # レア
-]
 
-# --- シード（ゲーム毎に変えたいなら reset_game で更新） ---
-BG_RANDOM_SEED = 1337
+# === 2D背景　===
+def prepare_bg(tiles, tile_w, tile_h, preserve_aspect=True, placeholder_alpha=255):
+    """
+    背景タイルの読み込みと重み付け初期化（透明対応）
+    - 透過画像OK（convert_alpha）
+    - preserve_aspect=True なら縦横比を保持し、余白は透明でパディング
+    """
+    images, cum, total = [], [], 0.0
 
-# --- タイルキャッシュ（グリッド→選ばれたタイルindex を保持） ---
-bg_tile_cache = {}
-
-# --- 読み込み（サイズ統一） ---
-def load_bg_tiles(tiles, tile_w, tile_h):
-    def scale_to_square(img, size):
-        w, h = img.get_width(), img.get_height()
-        if w == h:
-            return pygame.transform.smoothscale(img, (size, size))
-        # 画像全体が入るように「長辺=サイズ」に合わせて縮放し、余白は透明でパディング
-        if w > h:
-            new_w = size
-            new_h = int(h * size / w)
-        else:
-            new_h = size
-            new_w = int(w * size / h)
-        scaled = pygame.transform.smoothscale(img, (new_w, new_h))
-        surf = pygame.Surface((size, size), pygame.SRCALPHA)
-        surf.blit(scaled, ((size - new_w)//2, (size - new_h)//2))
-        return surf
-
-    images, cum_weights, total = [], [], 0.0
     for path, w in tiles:
+        # --- 透過対応で読み込み ---
         try:
-            img = pygame.image.load(path).convert_alpha()  # 透明縁があってもOKに
+            img = pygame.image.load(path).convert_alpha()
         except pygame.error:
+            # アルファ付きのプレースホルダ
             img = pygame.Surface((tile_w, tile_h), pygame.SRCALPHA)
-            img.fill((40, 40, 40))
-            pygame.draw.rect(img, (80, 80, 80), (0, 0, tile_w, tile_h), 6)
+            img.fill((40, 40, 40, placeholder_alpha))
+            pygame.draw.rect(img, (80, 80, 80, placeholder_alpha), (0, 0, tile_w, tile_h), 6)
 
-        # ★正方形に収める（タイルは tile_w == tile_h になっている前提）
-        img = scale_to_square(img, tile_w)
+        # --- リサイズ（縦横比を保つ/保たない を選択） ---
+        if preserve_aspect:
+            w0, h0 = img.get_width(), img.get_height()
+            if w0 == 0 or h0 == 0:
+                # 破損時の保険
+                fitted = pygame.Surface((tile_w, tile_h), pygame.SRCALPHA)
+            else:
+                scale = min(tile_w / w0, tile_h / h0)
+                new_w = max(1, int(w0 * scale))
+                new_h = max(1, int(h0 * scale))
+                scaled = pygame.transform.smoothscale(img, (new_w, new_h))
+                fitted = pygame.Surface((tile_w, tile_h), pygame.SRCALPHA)  # 透明背景
+                fitted.blit(scaled, ((tile_w - new_w) // 2, (tile_h - new_h) // 2))
+            img = fitted
+        else:
+            if img.get_size() != (tile_w, tile_h):
+                img = pygame.transform.smoothscale(img, (tile_w, tile_h))
+
         images.append(img)
 
+        # --- 重みを累積 ---
         total += max(0.0, float(w))
-        cum_weights.append(total)
+        cum.append(total)
 
+    # すべての重みが0以下のとき等確率に
     if total <= 0:
-        cum_weights = [i+1 for i in range(len(images))]
+        cum = [i + 1 for i in range(len(images))]
         total = float(len(images))
-    return images, cum_weights, total
 
-# --- グリッドごとの重み付き乱数選択（安定乱数） ---
-def _tile_hash(gx: int, gy: int) -> int:
-    return ((gx * 1836311903) ^ (gy * 2971215073) ^ BG_RANDOM_SEED) & 0xffffffff
+    return {"images": images, "cum": cum, "total": total, "cache": {}}
 
-def _pick_weighted_index_from_hash(gx: int, gy: int) -> int:
-    h = _tile_hash(gx, gy)
-    t = (h / 4294967295.0) * bg_weights_total  # [0,total)
-    for i, cw in enumerate(bg_cum_weights):
-        if t < cw:
-            return i
-    return len(bg_cum_weights) - 1
-
-def get_tile_index(gx: int, gy: int) -> int:
-    key = (gx, gy)
-    idx = bg_tile_cache.get(key)
-    if idx is None:
-        idx = _pick_weighted_index_from_hash(gx, gy)
-        bg_tile_cache[key] = idx
-    return idx
-
-# === タイル座標ユーティリティ ===
-# スポーン時のタイル(0,0)の“ワールド左上”をアンカーとして保持する
-SPAWN_ANCHOR_WX = 0
-SPAWN_ANCHOR_WY = 0
-SPAWN_TILE_GX = 0
-SPAWN_TILE_GY = 0
-
-def world_to_tile(wx, wy):
-    """ワールド座標(px) → タイル座標(gx, gy) へ（現在の TILE_W/H を使用）"""
-    return int(math.floor(wx / TILE_W)), int(math.floor(wy / TILE_H))
-
-def recalc_spawn_tile_indices():
-    """現在のタイルサイズに合わせてスポーン(0,0)のタイル座標を再計算"""
-    global SPAWN_TILE_GX, SPAWN_TILE_GY
-    SPAWN_TILE_GX = int(math.floor(SPAWN_ANCHOR_WX / TILE_W))
-    SPAWN_TILE_GY = int(math.floor(SPAWN_ANCHOR_WY / TILE_H))
-
-# --- 現在のズームに合わせてタイル再生成（正方形で統一） ---
-TILE_MIN = 64              # 俯瞰(0.1)でも小さく見せたいなら 32 でも可
-BASE_TILE_SCALE = 5.0      # 通常プレイ時の基準ズーム
-TILE_SCALE = BASE_TILE_SCALE
-
-def apply_tile_scale(scale: float):
-    global TILE_SCALE, TILE_W, TILE_H
-    global bg_seq, bg_cum_weights, bg_weights_total, bg_tile_cache
-
-    TILE_SCALE = float(scale)
-
-    # ★正方形サイズを決める（画面の短辺基準がおすすめ）
-    base_len   = min(SCREEN_WIDTH, SCREEN_HEIGHT)
-    TILE_SIZE  = max(TILE_MIN, int(base_len * TILE_SCALE))
-
-    # ★幅・高さとも同じ（=正方形）
-    TILE_W = TILE_SIZE
-    TILE_H = TILE_SIZE
-
-    # 並びはグリッド座標で決まるのでサイズ変更時はキャッシュを消す
-    bg_tile_cache.clear()
-    bg_seq, bg_cum_weights, bg_weights_total = load_bg_tiles(BG_TILES, TILE_W, TILE_H)
-    recalc_spawn_tile_indices()   # ← 追加：ズーム切替後も(0,0)を同じ場所に保つ
-
-# --- 初期生成（※ここで初めて呼ぶ） ---
-apply_tile_scale(TILE_SCALE)
-apply_tile_scale(TILE_SCALE)
-
-# --- 2D連結描画 ---
-def draw_bg_sequence_2d(surface, images, tile_w, tile_h, offset_x, offset_y):
-    if not images:
-        surface.fill((0, 0, 0)); return
+def draw_bg(surface, ctx, offset_x, offset_y, seed):
+    """背景をオフセット付きで描画"""
+    imgs, cum, total, cache = ctx["images"], ctx["cum"], ctx["total"], ctx["cache"]
+    if not imgs:
+        surface.fill((0,0,0)); return
     W, H = surface.get_width(), surface.get_height()
-    start_x = - (int(offset_x) % tile_w)
-    start_y = - (int(offset_y) % tile_h)
-    grid_x0 = int(offset_x) // tile_w
-    grid_y0 = int(offset_y) // tile_h
-    y, gy = start_y, grid_y0
-    while y < H:
-        x, gx = start_x, grid_x0
-        while x < W:
-            idx = get_tile_index(gx, gy)   # 重み付きランダム＋キャッシュ
-            surface.blit(images[idx], (x, y))
-            x += tile_w; gx += 1
-        y += tile_h; gy += 1
+    tw, th = imgs[0].get_width(), imgs[0].get_height()
 
-# 俯瞰マップのプレイヤー表示
-def bg_offset_from_camera(cx, cy):
+    start_x = - (int(offset_x) % tw)
+    start_y = - (int(offset_y) % th)
+    gx0 = int(offset_x) // tw
+    gy0 = int(offset_y) // th
+
+    def tile_index(gx, gy):
+        key = (gx, gy)
+        if key in cache: return cache[key]
+        h = ((gx * 1836311903) ^ (gy * 2971215073) ^ seed) & 0xffffffff
+        t = (h / 4294967295.0) * total
+        for i, cw in enumerate(cum):
+            if t < cw:
+                cache[key] = i
+                return i
+        cache[key] = len(cum) - 1
+        return cache[key]
+
+    y, gy = start_y, gy0
+    while y < H:
+        x, gx = start_x, gx0
+        while x < W:
+            surface.blit(imgs[tile_index(gx, gy)], (x, y))
+            x += tw; gx += 1
+        y += th; gy += 1
+
+# ワールドの中心座標を特定
+def center_of_tile(gx: int, gy: int, tile_w: int, tile_h: int):
+    """タイル (gx, gy) の“中心”ワールド座標を返す"""
+    return gx * tile_w + tile_w // 2, gy * tile_h + tile_h // 2
+
+# === スポーン中心（ワールド座標）を保持 ===
+SPAWN_CENTER_WX = None
+SPAWN_CENTER_WY = None
+
+def _rel_axis_to_tile(delta: float) -> int:
     """
-    カメラ（=プレイヤー）を画面中央に置くとき、
-    背景描画の offset_x/offset_y（= 画面左上のワールド座標）を返す。
+    スポーン中心からの片軸距離 delta(px) を「タイル数」に変換。
+    ルール:
+      |delta| < 5000      -> 0
+       delta >= +5000     -> 1 + ((delta - 5000) // 10000)
+       delta <= -5000     -> -1 - (((-delta) - 5000) // 10000)
     """
-    return int(cx - SCREEN_WIDTH // 2), int(cy - SCREEN_HEIGHT // 2)
+    if delta >= 5000:
+        return 1 + int((delta - 5000) // 10000)
+    elif delta <= -5000:
+        return -1 - int(((-delta) - 5000) // 10000)
+    else:
+        return 0
+
+def spawn_rel_tile(wx: float, wy: float) -> tuple[int, int]:
+    """ワールド座標→スポーン基準タイル座標 (gx, gy)"""
+    dx = wx - SPAWN_CENTER_WX
+    dy = wy - SPAWN_CENTER_WY
+    return _rel_axis_to_tile(dx), _rel_axis_to_tile(dy)
+
+def world_to_tile(wx: float, wy: float, tile_w: int = None, tile_h: int = None):
+    """
+    ワールド中心(5000,5000)がタイル(0,0)の中心になるタイル座標計算
+    """
+    tw = TILE_W if tile_w is None else tile_w
+    th = TILE_H if tile_h is None else tile_h
+    gx = int(math.floor((wx - 5000) / tw))
+    gy = int(math.floor((wy - 5000) / th))
+    return gx, gy
+
+# ==== 全体マップ =====
+def enter_minimap():
+    """縮小マップ表示へ切り替え（再ビルドなし）"""
+    global overlooking, TILE_W, TILE_H, bg_ctx
+    overlooking = True
+    TILE_W, TILE_H = MINIMAP_TILE_W, MINIMAP_TILE_H
+    bg_ctx = bg_ctx_mini  # 参照を差し替えるだけ（キャッシュも維持）
+
+def exit_minimap():
+    """縮小マップ表示を解除（再ビルドなし）"""
+    global overlooking, TILE_W, TILE_H, bg_ctx
+    overlooking = False
+    TILE_W, TILE_H = NORMAL_TILE_W, NORMAL_TILE_H
+    bg_ctx = bg_ctx_normal  # 参照を戻すだけ（キャッシュも維持）
+
 
 def draw_game(screen):
     global level_up_notice_rect
 
-    # ★ プレイヤーを中心にした背景オフセットを取得
-    bg_off_x, bg_off_y = bg_offset_from_camera(player_x, player_y)
+    # 変更後（ここがポイント）
+    bg_off_x = int(player_x - PLAYER_DRAW_X)
+    bg_off_y = int(player_y - PLAYER_DRAW_Y)
 
-    # 背景を先に描く（上書きしない）
-    draw_bg_sequence_2d(screen, bg_seq, TILE_W, TILE_H, bg_off_x, bg_off_y)
+    # --- 背景を最初に描く（上書きしない）---
+    draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
 
     # プレイヤー
     screen.blit(player_image, (PLAYER_DRAW_X, PLAYER_DRAW_Y))
+
+    if overlooking:
+        pygame.draw.circle(screen, (255, 0, 0), (PLAYER_DRAW_X + 15, PLAYER_DRAW_Y + 15), 6)
 
     # EXPアイテム
     for item in exp_items:
@@ -497,8 +492,9 @@ def draw_game(screen):
 
     time_font = jp_font(70)
     # 分と秒に分解
-    minutes = remaining_time // 60
-    seconds = remaining_time % 60
+    # ここで自前計算（グローバルは参照するだけ）
+    minutes = max(0, int((goel_time - int(game_time)) // 60))
+    seconds = max(0, int((goel_time - int(game_time)) % 60))
 
     # 表示形式（ゼロ埋め：01:05 など）
     remaining_time_text = time_font.render(f"{minutes:02d}:{seconds:02d}", True, (0, 0, 0))
@@ -516,7 +512,7 @@ def draw_game(screen):
     battery_text = font.render(f"Battery: {battery}", True, (255, 255, 0))
     score_text = font.render(f"Score: {score}", True, (0, 255, 255))
     enemy_level_text = font.render(f"Enemy Lv: {enemy_level}", True, (255, 255, 255))
-    coord_text = font.render(f"X: {int(player_x)}  Y: {int(player_y)}", True, (0, 0, 0)) 
+    coord_text = font.render(f"X: {int(player_x - 5000)}  Y: {int(player_y - 5000)}", True, (0, 0, 0)) 
     text_rect = coord_text.get_rect()
     text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 10)
 
@@ -527,43 +523,35 @@ def draw_game(screen):
     screen.blit(enemy_level_text, (10, 170))
     screen.blit(coord_text, text_rect)
 
+    # === タイル座標の表示（新規） ===
+    gx, gy = spawn_rel_tile(player_x, player_y)
+    tile_text = font.render(f"Tile: ({gx}, {gy})", True, (50, 50, 50))
+    tile_text_rect = tile_text.get_rect()
+    tile_text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 40)  # 既存の座標より少し上
+    screen.blit(tile_text, tile_text_rect)
+
 # ===============================
 # ゲームリセット
 # ===============================
 def reset_game():
     global BG_RANDOM_SEED
-    global player_x, player_y, player_hp, player_max_hp, base_attack, exp, level, exp_to_next, exp_rato, player_speed, player_defence, player_clitical_rato, player_clitical_damage, PLAYER_IFRAME_MAX, player_iframe, player_vx, player_vy
+    global player_x, player_y, SPAWN_CENTER_WX, SPAWN_CENTER_WY, player_hp, player_max_hp, base_attack, exp, level, exp_to_next, exp_rato, player_speed, player_defence, player_clitical_rato, player_clitical_damage, PLAYER_IFRAME_MAX, player_iframe, player_vx, player_vy
     global weapons, weapon_counter, lasers, laser_level, laser_timer, laser_cooldown, laser_duration, enemy_spawn_timer, score, start_ticks
     global enemies, enemy_base_hp, enemy_base_attack, enemy_speed, enemy_level, last_buff_time, ENEMY_RADIUS, ENEMY_SEP_ITER
     global damage_texts
-    global exp_items, start_ticks, battery, battery_items, MAGNET_RADIUS, ITEM_HOMING_SPEED, SPAWN_ANCHOR_WX, SPAWN_ANCHOR_WY
+    global exp_items, start_ticks, battery, battery_items, MAGNET_RADIUS, ITEM_HOMING_SPEED
     global shortwaves, Weapon_shortwave_image, shortwave_base_w, shortwave_base_h, initial_scale, shortwave_level, weapon_shortwave_cooldown, weapon_shortwave_duration, weapon_shortwave_timer
     global game_speed, game_time, goel_time, game_clear
     global LEVELUP_PICK_COUNT
 
     start_ticks = pygame.time.get_ticks()  # ← ゲーム開始時刻（ミリ秒）
 
-    # --- スポーンタイルを(0,0)に固定し、プレイヤーはそのタイルの「中心」に置く ---
-    # タイルの左上座標（アンカー）を記録
-    SPAWN_TILE_GX = 0
-    SPAWN_TILE_GY = 0
-    SPAWN_ANCHOR_WX = SPAWN_TILE_GX * TILE_W
-    SPAWN_ANCHOR_WY = SPAWN_TILE_GY * TILE_H
-    recalc_spawn_tile_indices()  # 上のANCHORから(0,0)のタイル番号を再計算
-
-    SPAWN_TILE_GX = 0; SPAWN_TILE_GY = 0
-    SPAWN_ANCHOR_WX = SPAWN_TILE_GX * TILE_W
-    SPAWN_ANCHOR_WY = SPAWN_TILE_GY * TILE_H
-    recalc_spawn_tile_indices()
-    player_x, player_y = center_of_tile(SPAWN_TILE_GX, SPAWN_TILE_GY)
-
-    # タイル中心 = 左上 + (TILE_W/2, TILE_H/2)
-    player_x = SPAWN_ANCHOR_WX + TILE_W // 2
-    player_y = SPAWN_ANCHOR_WY + TILE_H // 2
+    player_x, player_y = center_of_tile(0, 0, TILE_W, TILE_H)
+    SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
 
     # マップのリセット
-    bg_tile_cache.clear()
     BG_RANDOM_SEED = random.randint(0, 2**31 - 1)
+    bg_ctx["cache"].clear()
 
     #ゲームスピード
     game_speed = 1.0
@@ -1037,6 +1025,33 @@ BASE_BG_AUTO_VX = 0.4   # 自動でゆっくり流れる速度
 BASE_BG_AUTO_VY = 0.2
 BASE_BG_PARALLAX = 0.3  # 入力に対するパララックス寄与（0〜1）
 
+# === 背景の初期化 ===
+TILE_W = 10000
+TILE_H = 10000
+# ミニマップ用のプレイヤー表示サイズ（px）
+OVERLOOK_PLAYER_PX = 14
+
+# 追加：通常タイル/ミニマップ用タイルの定数
+NORMAL_TILE_W, NORMAL_TILE_H = 10000, 10000
+MINIMAP_TILE_W, MINIMAP_TILE_H = 100, 100
+BG_TILES = [("bg1.png", 6), ("bg2.png", 3), ("bg3.png", 1)]
+BG_RANDOM_SEED = 1337
+# 追加：通常タイル/ミニマップ用タイルの定数（既に定義済みなら流用）
+NORMAL_TILE_W, NORMAL_TILE_H = 10000, 10000
+MINIMAP_TILE_W, MINIMAP_TILE_H = 100, 100
+BG_TILES = [("bg1.png", 6), ("bg2.png", 3), ("bg3.png", 1)]
+BG_RANDOM_SEED = 1337
+
+# ← ここを変更：最初に両方ビルドしておく（1回きり）
+bg_ctx_normal = prepare_bg(BG_TILES, NORMAL_TILE_W, NORMAL_TILE_H)
+bg_ctx_mini   = prepare_bg(BG_TILES, MINIMAP_TILE_W, MINIMAP_TILE_H)
+bg_ctx = bg_ctx_normal  # 現在の参照を通常用に
+# 任意：初回に軽くタイルキャッシュを温める
+_tmp = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+draw_bg(_tmp, bg_ctx_normal, 0, 0, BG_RANDOM_SEED)
+draw_bg(_tmp, bg_ctx_mini,   0, 0, BG_RANDOM_SEED)
+del _tmp
+
 # -----------------------------
 # Power Up のコスト設定
 # -----------------------------
@@ -1050,9 +1065,6 @@ LEVEL_CHOICE_GAP = 24          # 画像の間隔（px）
 
 #レベルアップ通知テキスト当たり判定
 level_up_notice_rect = None
-
-# 俯瞰モード時に表示するプレイヤーアイコンのピクセルサイズ
-OVERLOOK_PLAYER_PX = 20
 
 # -----------------------------
 # Power Up 関数
@@ -1149,9 +1161,6 @@ while running:
                 if event.key == pygame.K_ESCAPE:
                     in_base = False
                     game_start = True
-                if event.key == pygame.K_h:
-                    base_world_x = 0
-                    base_world_y = 0
 
         # 入力（ワールド座標を更新：右に進む=世界を左へ流すのと同義）
         keys = pygame.key.get_pressed()
@@ -1343,6 +1352,11 @@ while running:
                             choice_waiting = False
                             selected_choice_idx = None
                             continue
+                        # --- ミニマップ中の終了操作（優先的に処理）---
+                    if overlooking and (event.key == pygame.K_o or event.key == pygame.K_ESCAPE or event.key == pygame.K_p):
+                        exit_minimap()
+                        paused = False           # そのままゲーム再開
+                        continue
 
                     # ↑待ち中ではない通常のキー
                     if event.key == pygame.K_ESCAPE:
@@ -1392,6 +1406,75 @@ while running:
                                     choice_waiting = False
                                     selected_choice_idx = None
 
+            # ===== 俯瞰モード（背景＋スポーン基準タイル座標ラベル＋player.png） =====
+            if overlooking:
+                # ミニマップ時は TILE_W/H = 100,100 の想定
+                tw, th = TILE_W, TILE_H
+
+                # 1) プレイヤーがいる「スポーン基準タイル番号」
+                lgx, lgy = spawn_rel_tile(player_x, player_y)
+
+                # 2) そのタイルの「左上」を画面中央に置く
+                tile_lx = lgx * tw
+                tile_ly = lgy * th
+
+                # 3) 指定の“微パン” (px)
+                pan_x = (player_x - SPAWN_CENTER_WX) / 50000.0
+                pan_y = (player_y - SPAWN_CENTER_WY) / 50000.0
+
+                bg_off_x = int(tile_lx - (SCREEN_WIDTH  // 2) - pan_x)
+                bg_off_y = int(tile_ly - (SCREEN_HEIGHT // 2) - pan_y)
+
+                # 背景のみ描画
+                draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
+
+                # 4) 画面に見えている“描画タイル”のインデックス
+                base_gx = int(math.floor(bg_off_x / tw))
+                base_gy = int(math.floor(bg_off_y / th))
+                start_x = - (bg_off_x % tw)
+                start_y = - (bg_off_y % th)
+
+                # 5) 画面中央に来ているタイル（左上）の“描画タイル”インデックス
+                ix_center = base_gx + ((SCREEN_WIDTH  // 2 - start_x) // tw)
+                iy_center = base_gy + ((SCREEN_HEIGHT // 2 - start_y) // th)
+
+                # 6) それぞれの描画タイル (gx_iter, gy_iter) を
+                #    「スポーン基準タイル番号」に変換してラベル表示
+                id_font = jp_font(14)
+                y = start_y; gy_iter = base_gy
+                while y < SCREEN_HEIGHT:
+                    x = start_x; gx_iter = base_gx
+                    while x < SCREEN_WIDTH:
+                        # スポーン基準 = 「プレイヤーの論理タイル lg* 」を基準にずらす
+                        label_gx = lgx + (gx_iter - ix_center)
+                        label_gy = lgy + (gy_iter - iy_center)
+
+                        label = f"({label_gx},{label_gy})"
+                        shadow = id_font.render(label, True, (0, 0, 0))
+                        text   = id_font.render(label, True, (255, 255, 255))
+                        screen.blit(shadow, (x + 1, y + 1))
+                        screen.blit(text,   (x,     y))
+
+                        # 任意：グリッド線
+                        # pygame.draw.rect(screen, (0,0,0), (x, y, tw, th), 1)
+
+                        x += tw; gx_iter += 1
+                    y += th; gy_iter += 1
+
+                # プレイヤーはタイル中心に固定表示（player.png）
+                px = SCREEN_WIDTH  // 2 + tw // 2 - player_original.get_width()  // 2
+                py = SCREEN_HEIGHT // 2 + th // 2 - player_original.get_height() // 2
+                screen.blit(player_original, (px, py))
+
+                # ヒント
+                hint_font = jp_font(22)
+                hint = hint_font.render("O または ESC で閉じる", True, (0, 0, 0))
+                screen.blit(hint, (20, 20))
+
+                pygame.display.flip()
+                clock.tick(60)
+                continue
+
             # --- ゲーム画面（通常の見た目）をまず描画 ---
             draw_game(screen)
 
@@ -1417,7 +1500,7 @@ while running:
             base_attack_text = font.render(f"base attack: {base_attack}", True, (0, 0, 0))
             clitical_rato_text = font.render(f"critical rato: {player_clitical_rato * 100} %", True, (0, 0, 0))
             clitical_damage_text = font.render(f"critical damage: × {player_clitical_damage}", True, (0, 0, 0))
-            coord_text = font.render(f"X: {player_x}  Y: {player_y}", True, (0, 0, 0))
+            coord_text = font.render(f"X: {player_x - 5000}  Y: {player_y - 5000}", True, (0, 0, 0))
             text_rect = coord_text.get_rect()
             text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 10)
 
@@ -1497,80 +1580,6 @@ while running:
             clock.tick(60)
             continue
 
-        # ===== 俯瞰モード（背景＋タイルID＋クリックで座標表示） =====
-        if overlooking:
-            # 俯瞰中は現在タイルスケール / 基準スケール が「縮小率」
-            scale_ratio = TILE_SCALE / BASE_TILE_SCALE  # 例: 0.1 / 5.0 = 1/50
-
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_ESCAPE, pygame.K_p, pygame.K_o):
-                        apply_tile_scale(BASE_TILE_SCALE)
-                        overlooking = False
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    # “縮小後”オフセット + 画面座標 を、逆比率でワールドに戻す
-                    bg_off_x_scaled = int((player_x - SCREEN_WIDTH // 2) * scale_ratio)
-                    bg_off_y_scaled = int((player_y - SCREEN_HEIGHT // 2) * scale_ratio)
-
-                    wx = int((bg_off_x_scaled + event.pos[0]) / scale_ratio)
-                    wy = int((bg_off_y_scaled + event.pos[1]) / scale_ratio)
-
-                    gx, gy = world_to_tile(wx, wy)
-                    rel_x = gx - SPAWN_TILE_GX
-                    rel_y = gy - SPAWN_TILE_GY
-                    last_clicked_label = f"Clicked tile: ({rel_x}, {rel_y})"
-                    last_clicked_ttl   = 120
-                    print(last_clicked_label)
-
-            # ★縮小したオフセットで背景を描く（1回だけ）
-            bg_off_x_scaled = int((player_x - SCREEN_WIDTH // 2) * scale_ratio)
-            bg_off_y_scaled = int((player_y - SCREEN_HEIGHT // 2) * scale_ratio)
-            draw_bg_sequence_2d(screen, bg_seq, TILE_W, TILE_H, bg_off_x_scaled, bg_off_y_scaled)
-
-            # プレイヤーアイコンは中央固定（重複描画しない）
-            mini_player = pygame.transform.smoothscale(player_original, (OVERLOOK_PLAYER_PX, OVERLOOK_PLAYER_PX))
-            screen.blit(mini_player, (SCREEN_WIDTH // 2 - OVERLOOK_PLAYER_PX // 2,
-                                      SCREEN_HEIGHT // 2 - OVERLOOK_PLAYER_PX // 2))
-
-            # ▼ ここからID描画（縮小オフセットを使う！）
-            W, H = SCREEN_WIDTH, SCREEN_HEIGHT
-            start_x = - (int(bg_off_x_scaled) % TILE_W)
-            start_y = - (int(bg_off_y_scaled) % TILE_H)
-            grid_x0 = int(bg_off_x_scaled) // TILE_W
-            grid_y0 = int(bg_off_y_scaled) // TILE_H
-
-            id_font = jp_font(14)
-            y, gy = start_y, grid_y0
-            while y < H:
-                x, gx = start_x, grid_x0
-                while x < W:
-                    rel_x = gx - SPAWN_TILE_GX
-                    rel_y = gy - SPAWN_TILE_GY
-                    txt = id_font.render(f"{rel_x},{rel_y}", True, (0, 0, 0))
-                    screen.blit(txt, (x + 6, y + 6))
-                    pygame.draw.rect(screen, (0, 0, 0), (x, y, TILE_W, TILE_H), 1)
-                    x += TILE_W; gx += 1
-                y += TILE_H; gy += 1
-
-            # 直近クリック表示（任意）
-            try:
-                if last_clicked_ttl > 0:
-                    tip_font = jp_font(22)
-                    tip = tip_font.render(last_clicked_label, True, (0, 0, 0))
-                    screen.blit(tip, (10, SCREEN_HEIGHT - 40))
-                    last_clicked_ttl -= 1
-            except NameError:
-                last_clicked_label = ""
-                last_clicked_ttl = 0
-
-            pygame.display.flip()
-            clock.tick(60)
-            continue
-
-
-
         #ゲーム内経過時間会得
         delta_time = 1 / 60.0   # 1フレームあたりの秒数（60FPS前提）
         game_time += delta_time * game_speed
@@ -1603,13 +1612,10 @@ while running:
                 elif event.key == pygame.K_p:
                     paused = not paused
                 elif event.key == pygame.K_o:
-                    if not overlooking:
-                        # 1/50にしたいなら基準の1/50へ
-                        apply_tile_scale(BASE_TILE_SCALE / 50.0)
-                        overlooking = True
-                    else:
-                        apply_tile_scale(BASE_TILE_SCALE)
-                        overlooking = False
+                    # Oで「一時停止に入ってから」ミニマップON
+                    if not paused:
+                        paused = True
+                    enter_minimap()
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
             # 「level up available」の文字が押されたらポーズを開く
