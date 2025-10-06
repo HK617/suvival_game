@@ -402,18 +402,54 @@ def world_to_tile(wx: float, wy: float, tile_w: int = None, tile_h: int = None):
 
 # ==== 全体マップ =====
 def enter_minimap():
-    """縮小マップ表示へ切り替え（再ビルドなし）"""
-    global overlooking, TILE_W, TILE_H, bg_ctx
+    global overlooking, TILE_W, TILE_H, bg_ctx, LABEL_GRID_CACHE
     overlooking = True
     TILE_W, TILE_H = MINIMAP_TILE_W, MINIMAP_TILE_H
-    bg_ctx = bg_ctx_mini  # 参照を差し替えるだけ（キャッシュも維持）
+    bg_ctx = bg_ctx_mini
+    LABEL_GRID_CACHE.clear()
 
 def exit_minimap():
-    """縮小マップ表示を解除（再ビルドなし）"""
-    global overlooking, TILE_W, TILE_H, bg_ctx
+    global overlooking, TILE_W, TILE_H, bg_ctx, LABEL_GRID_CACHE
     overlooking = False
     TILE_W, TILE_H = NORMAL_TILE_W, NORMAL_TILE_H
-    bg_ctx = bg_ctx_normal  # 参照を戻すだけ（キャッシュも維持）
+    bg_ctx = bg_ctx_normal
+    LABEL_GRID_CACHE.clear()
+
+# 旧: def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th):
+def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th,
+                              center_lgx, center_lgy, ix_center, iy_center):
+    """
+    画面に映る描画タイル (base_gx.., base_gy..) に対して、
+    「画面中央の論理タイル (center_lgx, center_lgy)」からの差分で
+    スポーン基準タイル座標ラベルを描く。
+    """
+    global LABEL_FONT
+    if LABEL_FONT is None:
+        LABEL_FONT = jp_font(14)
+
+    surf = pygame.Surface((cols * tw, rows * th), pygame.SRCALPHA)
+
+    for j in range(rows):
+        gy_iter = base_gy + j
+        y = j * th
+        for i in range(cols):
+            gx_iter = base_gx + i
+            x = i * tw
+
+            # 画面中央の“描画タイル index”との差分で論理タイル座標を求める
+            label_gx = center_lgx + (gx_iter - ix_center)
+            label_gy = center_lgy + (gy_iter - iy_center)
+
+            label = f"({label_gx},{label_gy})"
+            shadow = LABEL_FONT.render(label, True, (0, 0, 0))
+            text   = LABEL_FONT.render(label, True, (255, 255, 255))
+            surf.blit(shadow, (x + 1, y + 1))
+            surf.blit(text,   (x,     y))
+
+            # （任意）グリッド線
+            pygame.draw.rect(surf, (0, 0, 0), (x, y, tw, th), 1)
+
+    return surf
 
 
 def draw_game(screen):
@@ -542,7 +578,7 @@ def reset_game():
     global BG_RANDOM_SEED
     global player_x, player_y, SPAWN_CENTER_WX, SPAWN_CENTER_WY, player_hp, player_max_hp, base_attack, exp, level, exp_to_next, exp_rato, player_speed, player_defence, player_clitical_rato, player_clitical_damage, PLAYER_IFRAME_MAX, player_iframe, player_vx, player_vy
     global weapons, weapon_counter, lasers, laser_level, laser_timer, laser_cooldown, laser_duration, enemy_spawn_timer, score, start_ticks
-    global enemies, enemy_base_hp, enemy_base_attack, enemy_speed, enemy_level, last_buff_time, ENEMY_RADIUS, ENEMY_SEP_ITER
+    global enemies, enemy_base_hp, enemy_base_attack, enemy_speed, enemy_level, last_buff_time, ENEMY_RADIUS, ENEMY_SEP_ITER, LABEL_FONT, LABEL_GRID_CACHE
     global damage_texts
     global exp_items, start_ticks, battery, battery_items, MAGNET_RADIUS, ITEM_HOMING_SPEED
     global shortwaves, Weapon_shortwave_image, shortwave_base_w, shortwave_base_h, initial_scale, shortwave_level, weapon_shortwave_cooldown, weapon_shortwave_duration, weapon_shortwave_timer
@@ -557,6 +593,9 @@ def reset_game():
     # マップのリセット
     BG_RANDOM_SEED = random.randint(0, 2**31 - 1)
     bg_ctx["cache"].clear()
+
+    LABEL_FONT = jp_font(14)   # ← ここで再初期化
+    LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
 
     #ゲームスピード
     game_speed = 1.0
@@ -1036,6 +1075,15 @@ TILE_H = 10000
 # ミニマップ用のプレイヤー表示サイズ（px）
 OVERLOOK_PLAYER_PX = 14
 
+# ミニマップのラベル用フォント（起動時に設定）
+LABEL_FONT = None
+if LABEL_FONT is None:
+    LABEL_FONT = jp_font(14)
+
+# ミニマップのラベルグリッドをキャッシュ
+# key = (base_gx, base_gy, cols, rows, tw, th)
+LABEL_GRID_CACHE = {}
+
 # 追加：通常タイル/ミニマップ用タイルの定数
 NORMAL_TILE_W, NORMAL_TILE_H = 10000, 10000
 MINIMAP_TILE_W, MINIMAP_TILE_H = 100, 100
@@ -1445,26 +1493,35 @@ while running:
 
                 # 6) それぞれの描画タイル (gx_iter, gy_iter) を
                 #    「スポーン基準タイル番号」に変換してラベル表示
-                id_font = jp_font(14)
-                y = start_y; gy_iter = base_gy
-                while y < SCREEN_HEIGHT:
-                    x = start_x; gx_iter = base_gx
-                    while x < SCREEN_WIDTH:
-                        # スポーン基準 = 「プレイヤーの論理タイル lg* 」を基準にずらす
-                        label_gx = lgx + (gx_iter - ix_center)
-                        label_gy = lgy + (gy_iter - iy_center)
+                tw, th = TILE_W, TILE_H
+                W, H = SCREEN_WIDTH, SCREEN_HEIGHT
 
-                        label = f"({label_gx},{label_gy})"
-                        shadow = id_font.render(label, True, (0, 0, 0))
-                        text   = id_font.render(label, True, (255, 255, 255))
-                        screen.blit(shadow, (x + 1, y + 1))
-                        screen.blit(text,   (x,     y))
+                # 画面に出る最初の描画タイル index と、開始ピクセル
+                base_gx = int(math.floor(bg_off_x / tw))
+                base_gy = int(math.floor(bg_off_y / th))
+                start_x = - (bg_off_x % tw)
+                start_y = - (bg_off_y % th)
 
-                        # 任意：グリッド線
-                        # pygame.draw.rect(screen, (0,0,0), (x, y, tw, th), 1)
+                # この画面で必要なタイル枚数（+1は端のはみ出し）
+                cols = W // tw + 2
+                rows = H // th + 2
 
-                        x += tw; gx_iter += 1
-                    y += th; gy_iter += 1
+                # 画面中央に来ている“描画タイル”の index
+                ix_center = base_gx + ((SCREEN_WIDTH  // 2 - start_x) // tw)
+                iy_center = base_gy + ((SCREEN_HEIGHT // 2 - start_y) // th)
+
+                # プレイヤーがいる“論理タイル”（±5000/10000ルール）
+                center_lgx, center_lgy = spawn_rel_tile(player_x, player_y)
+
+                # キャッシュキーに中心情報も入れる（中心タイルが変わったら作り直す）
+                key = (base_gx, base_gy, cols, rows, tw, th, center_lgx, center_lgy, ix_center, iy_center)
+                layer = LABEL_GRID_CACHE.get(key)
+                if layer is None:
+                    layer = build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th,
+                                      center_lgx, center_lgy, ix_center, iy_center)
+                    LABEL_GRID_CACHE[key] = layer
+
+                screen.blit(layer, (start_x, start_y))
 
                 # --- プレイヤーアイコンを「そのタイル内の実位置」に置く ---
                 # いま描いているタイル解像度（ミニマップ時は tw=th=100）
