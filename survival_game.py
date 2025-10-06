@@ -1517,51 +1517,34 @@ while running:
                 # 1) プレイヤーがいる「スポーン基準タイル番号」
                 lgx, lgy = spawn_rel_tile(player_x, player_y)
 
-                # 2) そのタイルの「左上」を画面中央に置く
-                tile_lx = lgx * tw
-                tile_ly = lgy * th
-
-                # 3) 指定の“微パン” (px)
-                pan_x = (player_x - SPAWN_CENTER_WX) / 50000.0
-                pan_y = (player_y - SPAWN_CENTER_WY) / 50000.0
-
-                bg_off_x = int(tile_lx - (SCREEN_WIDTH  // 2) - pan_x + minimap_cam_x)
-                bg_off_y = int(tile_ly - (SCREEN_HEIGHT // 2) - pan_y + minimap_cam_y)
+                # 2) そのタイルの「左上」を画面中央に置く（微パララックスは使わない）
+                bg_off_x = int(lgx * tw - (SCREEN_WIDTH  // 2) + minimap_cam_x)
+                bg_off_y = int(lgy * th - (SCREEN_HEIGHT // 2) + minimap_cam_y)
 
                 # 背景のみ描画
                 draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
 
-                # 4) 画面に見えている“描画タイル”のインデックス
-                base_gx = int(math.floor(bg_off_x / tw))
-                base_gy = int(math.floor(bg_off_y / th))
-                start_x = - (bg_off_x % tw)
-                start_y = - (bg_off_y % th)
+                # 4) 画面に見えている“描画タイル”のインデックス（divmodで安定化）
+                qx, rx = divmod(int(bg_off_x), tw)   # qx = base_gx,  rx = 0..tw-1
+                qy, ry = divmod(int(bg_off_y), th)   # qy = base_gy,  ry = 0..th-1
+                base_gx, base_gy = qx, qy
+                start_x, start_y = -rx, -ry
 
-                # 5) 画面中央に来ているタイル（左上）の“描画タイル”インデックス
-                ix_center = base_gx + ((SCREEN_WIDTH  // 2 - start_x) // tw)
-                iy_center = base_gy + ((SCREEN_HEIGHT // 2 - start_y) // th)
-
-                # 6) それぞれの描画タイル (gx_iter, gy_iter) を
-                #    「スポーン基準タイル番号」に変換してラベル表示
-                tw, th = TILE_W, TILE_H
-                W, H = SCREEN_WIDTH, SCREEN_HEIGHT
-
-                # 画面に出る最初の描画タイル index と、開始ピクセル
-                base_gx = int(math.floor(bg_off_x / tw))
-                base_gy = int(math.floor(bg_off_y / th))
-                start_x = - (bg_off_x % tw)
-                start_y = - (bg_off_y % th)
-
-                # この画面で必要なタイル枚数（+1は端のはみ出し）
-                cols = W // tw + 2
-                rows = H // th + 2
-
-                # 画面中央に来ている“描画タイル”の index
-                ix_center = base_gx + ((SCREEN_WIDTH  // 2 - start_x) // tw)
-                iy_center = base_gy + ((SCREEN_HEIGHT // 2 - start_y) // th)
+                # 画面の“左上”に映っている論理タイル（lgx/lgy はプレイヤーの論理タイル）
+                left_lgx = lgx + ((bg_off_x - lgx * tw) // tw)
+                left_lgy = lgy + ((bg_off_y - lgy * th) // th)
 
                 # プレイヤーがいる“論理タイル”（±5000/10000ルール）
                 center_lgx, center_lgy = spawn_rel_tile(player_x, player_y)
+                
+                # ラベル式  label = center_lg + (gx_iter - ix_center) を崩さず、
+                # 画面左上タイルのラベルが left_lg になるように ix_center を再定義
+                ix_center = base_gx - (left_lgx - center_lgx)
+                iy_center = base_gy - (left_lgy - center_lgy)
+
+                # 画面で必要なタイル枚数（端のはみ出し用に +2）
+                cols = SCREEN_WIDTH  // tw + 2
+                rows = SCREEN_HEIGHT // th + 2
 
                 # キャッシュキーに中心情報も入れる（中心タイルが変わったら作り直す）
                 key = (base_gx, base_gy, cols, rows, tw, th, center_lgx, center_lgy, ix_center, iy_center)
