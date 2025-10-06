@@ -169,6 +169,8 @@ LASER_LENGTH = 1200  # 例：1200px
 
 # セーブファイル名
 SAVE_FILE = "savedata.json"
+# マップ永続化用
+EXPLORED_TILES = set()  # {(gx, gy), ...} を保持（保存時はリストに変換）
 
 # フレームレート制御
 clock = pygame.time.Clock()
@@ -204,30 +206,40 @@ def jp_font(size):
 # ===============================
 def load_game_data():
     global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
+    global BG_RANDOM_SEED, EXPLORED_TILES
+
     if os.path.exists(SAVE_FILE):
         with open(SAVE_FILE, 'r') as f:
             try:
                 data = json.load(f)
                 persistent_attack_bonus = data.get("persistent_attack_bonus", 0)
-                persistent_speed_bonus = data.get("persistent_speed_bonus", 0)
-                persistent_maxhp_bonus = data.get("persistent_maxhp_bonus", 0)
-                persistent_exp_bonus = data.get("persistent_exp_bonus", 0)
-                battery = data.get("battery", 0)
+                persistent_speed_bonus  = data.get("persistent_speed_bonus", 0)
+                persistent_maxhp_bonus  = data.get("persistent_maxhp_bonus", 0)
+                persistent_exp_bonus    = data.get("persistent_exp_bonus", 0)
+                battery                 = data.get("battery", 0)
+
+                old_seed = BG_RANDOM_SEED
+                new_seed = data.get("bg_seed", old_seed)
+                BG_RANDOM_SEED = new_seed
+
+                # 探索履歴
+                tiles = data.get("explored_tiles", [])
+                EXPLORED_TILES = set((int(gx), int(gy)) for gx, gy in tiles if isinstance(gx, int) or isinstance(gy, int))
+
+                # シードが変わったなら全キャッシュ掃除
+                if new_seed != old_seed:
+                    clear_all_bg_caches()
+
                 print("セーブデータを読み込みました。")
             except json.JSONDecodeError:
                 print("セーブファイルの読み込みに失敗しました。初期値を使用します。")
-                persistent_attack_bonus = 0
-                persistent_speed_bonus = 0
-                persistent_maxhp_bonus = 0
-                persistent_exp_bonus = 0
+                persistent_attack_bonus = persistent_speed_bonus = persistent_maxhp_bonus = persistent_exp_bonus = 0
                 battery = 0
     else:
         print("セーブファイルが見つかりません。初期値を使用します。")
-        persistent_attack_bonus = 0
-        persistent_speed_bonus = 0
-        persistent_maxhp_bonus = 0
-        persistent_exp_bonus = 0
+        persistent_attack_bonus = persistent_speed_bonus = persistent_maxhp_bonus = persistent_exp_bonus = 0
         battery = 0
+
 
 # ===============================
 # セーブデータの保存
@@ -238,10 +250,14 @@ def save_game_data():
         "persistent_speed_bonus": persistent_speed_bonus,
         "persistent_maxhp_bonus": persistent_maxhp_bonus,
         "persistent_exp_bonus" : persistent_exp_bonus,
-        "battery": battery
+        "battery": battery,
+
+        #マップデータ
+        "bg_seed": BG_RANDOM_SEED,
+        "explored_tiles": list(EXPLORED_TILES),  # 例: [[0,0],[1,0],...]
     }
     with open(SAVE_FILE, 'w') as f:
-        json.dump(data, f, indent=4) # indent=4 で見やすく整形して保存
+        json.dump(data, f, indent=4)
     print("セーブデータを保存しました。")
 
 # ===============================
@@ -249,15 +265,48 @@ def save_game_data():
 # ===============================
 def delete_save_data():
     global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
-    # 永続データを初期化（サバイバー安全初期値）
+    global BG_RANDOM_SEED, EXPLORED_TILES
+
+    # 永続データを初期化
     persistent_attack_bonus = 1
     persistent_speed_bonus  = 5
     persistent_maxhp_bonus  = 10
     persistent_exp_bonus    = 1
     battery = 0
+
+    # 探索済みクリア
+    EXPLORED_TILES.clear()
+
+    # マップシードを振り直し → ぜんぶの背景キャッシュを空に
+    BG_RANDOM_SEED = random.randint(0, 2**31 - 1)
+    clear_all_bg_caches()
+
+    # 新しいシード・空の探索履歴で保存
     save_game_data()
-    # ゲーム全体をリセット（即時反映）
+
+    # ゲーム状態リセット（reset_game は seed をいじらない）
     reset_game()
+
+# マップ情報の削除
+def clear_all_bg_caches():
+    """背景タイルのキャッシュを全てクリア（通常・ミニマップ・ズーム別）"""
+    # 通常/ミニマップの既定コンテキスト
+    for name in ("bg_ctx", "bg_ctx_normal", "bg_ctx_mini"):
+        ctx = globals().get(name)
+        if isinstance(ctx, dict):
+            cache = ctx.get("cache")
+            if isinstance(cache, dict):
+                cache.clear()
+    # ズームごとのミニマップ用コンテキスト
+    if "MINIMAP_CTXS" in globals():
+        for ctx in MINIMAP_CTXS.values():
+            if isinstance(ctx, dict):
+                cache = ctx.get("cache")
+                if isinstance(cache, dict):
+                    cache.clear()
+    # ミニマップのラベル（座標表示）のグリッドキャッシュも念のため
+    if "LABEL_GRID_CACHE" in globals() and isinstance(LABEL_GRID_CACHE, dict):
+        LABEL_GRID_CACHE.clear()
 
 # ===============================
 # ゲーム描画
@@ -598,12 +647,15 @@ def draw_game(screen):
     screen.blit(enemy_level_text, (10, 170))
     screen.blit(coord_text, text_rect)
 
-    # === タイル座標の表示（新規） ===
+        # === タイル座標の表示（新規） ===
     gx, gy = spawn_rel_tile(player_x, player_y)
     tile_text = font.render(f"Tile: ({gx}, {gy})", True, (50, 50, 50))
     tile_text_rect = tile_text.get_rect()
-    tile_text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 40)  # 既存の座標より少し上
+    tile_text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 40)
     screen.blit(tile_text, tile_text_rect)
+
+    # ★ 探索済みタイルに追加（重複は set なので気にしない）
+    EXPLORED_TILES.add((gx, gy))
 
 # ===============================
 # ゲームリセット
@@ -623,10 +675,6 @@ def reset_game():
 
     player_x, player_y = center_of_tile(0, 0, TILE_W, TILE_H)
     SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
-
-    # マップのリセット
-    BG_RANDOM_SEED = random.randint(0, 2**31 - 1)
-    bg_ctx["cache"].clear()
 
     LABEL_FONT = jp_font(14)   # ← ここで再初期化
     LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
@@ -1060,9 +1108,6 @@ player_speed = 5
 ENEMY_SPAWN_INTERVAL = 30
 MAX_ENEMIES = 250
 
-# プログラム開始時にセーブデータを読み込む
-load_game_data()
-
 # フラグリスト
 running = True
 in_base = False
@@ -1121,6 +1166,7 @@ LABEL_GRID_CACHE = {}
 # 追加：通常タイル/ミニマップ用タイルの定数
 NORMAL_TILE_W, NORMAL_TILE_H = 10000, 10000
 MINIMAP_TILE_W, MINIMAP_TILE_H = 100, 100
+#タイルの出現確率
 BG_TILES = [("bg1.png", 6), ("bg2.png", 3), ("bg3.png", 1)]
 BG_RANDOM_SEED = 1337
 
@@ -1128,6 +1174,9 @@ BG_RANDOM_SEED = 1337
 bg_ctx_normal = prepare_bg(BG_TILES, NORMAL_TILE_W, NORMAL_TILE_H)
 bg_ctx_mini   = prepare_bg(BG_TILES, MINIMAP_TILE_W, MINIMAP_TILE_H)
 bg_ctx = bg_ctx_normal
+
+# プログラム開始時にセーブデータを読み込む
+load_game_data()
 
 MINIMAP_CTXS[100] = bg_ctx_mini
 
@@ -1536,7 +1585,7 @@ while running:
 
                 # プレイヤーがいる“論理タイル”（±5000/10000ルール）
                 center_lgx, center_lgy = spawn_rel_tile(player_x, player_y)
-                
+
                 # ラベル式  label = center_lg + (gx_iter - ix_center) を崩さず、
                 # 画面左上タイルのラベルが left_lg になるように ix_center を再定義
                 ix_center = base_gx - (left_lgx - center_lgx)
