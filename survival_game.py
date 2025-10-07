@@ -2392,17 +2392,23 @@ while running:
             # --- X軸移動の衝突 ---
             nx = ex_prev + step_x
             test_rect_x = pygame.Rect(int(nx), int(ey_prev), enemy['rect'].w, enemy['rect'].h)
+            hit_block = False
+            hit_block_br = None
             for br in border_blocks:
-                if test_rect_x.colliderect(br["rect"]):   # ← ここを修正
+                if test_rect_x.colliderect(br["rect"]):
                     nx = ex_prev
+                    hit_block = True
+                    hit_block_br = br    # ← どのブロックに当たったか保持
                     break
 
             # --- Y軸移動の衝突 ---
             ny = ey_prev + step_y
             test_rect_y = pygame.Rect(int(nx), int(ny), enemy['rect'].w, enemy['rect'].h)
             for br in border_blocks:
-                if test_rect_y.colliderect(br["rect"]):   # ← ここを修正
+                if test_rect_y.colliderect(br["rect"]):
                     ny = ey_prev
+                    hit_block = True
+                    hit_block_br = br    # ← こちら側で当たるケースも保持
                     break
 
             # 確定
@@ -2410,6 +2416,21 @@ while running:
             enemy['rect'].x = int(nx)
             enemy['rect'].y = int(ny)
 
+            # === ★ ブロックに当たっている場合の攻撃処理（1秒に1回） ===
+            if hit_block and hit_block_br is not None:
+                now = pygame.time.get_ticks()
+                last_attack = enemy.get("last_block_attack", 0)
+                if now - last_attack >= 2000:  # 2秒(2000ms)おき
+                    enemy["last_block_attack"] = now
+                    dmg = max(1, int(enemy.get('atk', 1)))  # その時の攻撃力を使用（保険で最低1）
+                    hit_block_br["hp"] -= dmg
+
+                    if hit_block_br["hp"] <= 0:
+                        try:
+                            border_blocks.remove(hit_block_br)
+                        except ValueError:
+                            pass
+                        
         # 全員動かし終わってから1回だけ、重なり解消
         resolve_enemy_collisions(enemies)
 
@@ -2616,6 +2637,10 @@ while running:
             enemy_base_attack *= 2
             enemy_level += 1
             last_buff_time = current_ticks
+
+            # ★既存の敵にも攻撃力を反映したい場合（任意）
+            for e in enemies:
+                e['atk'] *= 2
 
         #=======================================
         # --- 描画 ---
