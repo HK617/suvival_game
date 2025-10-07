@@ -633,11 +633,7 @@ minimap_cam_y = 0.0         # ミニマップ内カメラのYオフセット（p
 
 
 #=============建築物の描画====================
-def build_spawn_border(cx, cy, half=500): #halfで囲いの大きさを設定
-    """
-    スポーン中心 (cx, cy) を中心に、辺長 2*half の正方形を
-    50px ブロックで「外周」だけ埋める。返り値は Rect のリスト（ワールド座標）。
-    """
+def build_spawn_border(cx, cy, half=300, block_hp=100):
     rects = []
     s = BLOCK_SIZE
     left   = cx - half
@@ -645,29 +641,43 @@ def build_spawn_border(cx, cy, half=500): #halfで囲いの大きさを設定
     top    = cy - half
     bottom = cy + half - s
 
-    # 上辺と下辺
+    def _push(x, y):
+        rects.append({"rect": pygame.Rect(int(x), int(y), s, s),
+                      "hp": block_hp, "max_hp": block_hp})
+
+    # 上下辺
     x = left
     while x <= right + 1:
-        rects.append(pygame.Rect(int(x), int(top), s, s))
-        rects.append(pygame.Rect(int(x), int(bottom), s, s))
+        _push(x, top)
+        _push(x, bottom)
         x += s
-
-    # 左辺と右辺（角は重複しないように上下の内側だけ）
+    # 左右辺
     y = top + s
     while y <= bottom - 1:
-        rects.append(pygame.Rect(int(left),  int(y), s, s))
-        rects.append(pygame.Rect(int(right), int(y), s, s))
+        _push(left,  y)
+        _push(right, y)
         y += s
-
     return rects
 
 def rect_collides_any(r, rects):
     """r が rects のどれかと衝突していれば True"""
-    # 小さな数ならこれで十分高速
     for br in rects:
-        if r.colliderect(br):
+        rect = br["rect"] if isinstance(br, dict) and "rect" in br else br
+        if r.colliderect(rect):
             return True
     return False
+
+# HPバーの描画
+def draw_hp_bar(surf, x, y, w, h, hp, max_hp, back=(60,60,60), fill=(0,200,0), border=(0,0,0)):
+    hp = max(0, min(hp, max_hp))
+    # 背景
+    pygame.draw.rect(surf, back, (x, y, w, h))
+    # 中身
+    fw = int(w * (hp / max_hp)) if max_hp > 0 else 0
+    if fw > 0:
+        pygame.draw.rect(surf, fill, (x, y, fw, h))
+    # 枠
+    pygame.draw.rect(surf, border, (x, y, w, h), 1)
 
 
 def draw_game(screen):
@@ -681,24 +691,29 @@ def draw_game(screen):
     draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
 
     # === スポーン周りの壁ブロックを描画 ===
+    # === ブロック描画（画像） ===
     for br in border_blocks:
-        # ワールドRect → 画面Rectへ移動（プレイヤー中心カメラ）
-        screen_rect = br.move(-player_x + PLAYER_DRAW_X, -player_y + PLAYER_DRAW_Y)
-        # 画像をRectの左上にピッタリ置く
+        r = br["rect"]
+        screen_rect = r.move(-bg_off_x, -bg_off_y)
         screen.blit(block_img, screen_rect.topleft)
+
+        # HPバー（ブロックの上に表示）
+        bw = r.w
+        bar_w, bar_h = bw, 6
+        bar_x = screen_rect.x
+        bar_y = screen_rect.y - (bar_h + 2)
+        draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h, br["hp"], br["max_hp"], fill=(200,80,80))
+
 
     # （デバッグ）当たり判定の枠を表示したいとき
     # pygame.draw.rect(screen, (255, 0, 0), screen_rect, 1)
         # --- デバッグ: 当たり判定の可視化 ---
     if DEBUG_COLLISION_DRAW:
-        # ブロックの矩形（緑）
-        for br in border_blocks:
-            r = pygame.Rect(
-                int(br.x - bg_off_x),
-                int(br.y - bg_off_y),
-                br.w, br.h
-            )
-            pygame.draw.rect(screen, (0, 255, 0), r, 2)
+        if DEBUG_COLLISION_DRAW:
+            for br in border_blocks:
+                r = br["rect"]
+                rr = pygame.Rect(int(r.x - bg_off_x), int(r.y - bg_off_y), r.w, r.h)
+                pygame.draw.rect(screen, (0,255,0), rr, 2)
 
         # プレイヤーの矩形（赤）
         screen_cx = player_x - bg_off_x
@@ -736,6 +751,15 @@ def draw_game(screen):
     player_draw_y = SCREEN_HEIGHT // 2 - player_image.get_height() // 2 - 15
     screen.blit(player_image, (player_draw_x, player_draw_y))
 
+    # === プレイヤーHPバー ===
+    pw, ph = player_image.get_width(), player_image.get_height()
+    # 直前の blit に使った player_draw_x / player_draw_y をそのまま使う
+    bar_w, bar_h = max(40, pw), 7
+    bar_x = player_draw_x + (pw - bar_w) // 2
+    bar_y = player_draw_y - (bar_h + 4)
+    draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h, player_hp, player_max_hp, fill=(0, 180, 255))
+
+
     if overlooking:
         pygame.draw.circle(screen, (255, 0, 0), (PLAYER_DRAW_X + 15, PLAYER_DRAW_Y + 15), 6)
 
@@ -751,17 +775,50 @@ def draw_game(screen):
         draw_y = item["rect"].y - player_y + PLAYER_DRAW_Y
         screen.blit(battery_image, (draw_x, draw_y))
 
-    #敵
+    # どこか上（関数外でもOK）で一度だけ定義
+    ENEMY_MAX_HP_DEFAULT = 50
+
+    # 敵
     for enemy in enemies:
-        draw_x = enemy['x'] - player_x + PLAYER_DRAW_X
-        draw_y = enemy['y'] - player_y + PLAYER_DRAW_Y
+        # ---- HPの初期化（未設定キーがあっても落ちないよう保険）----
+        enemy.setdefault('hp', 50)                 # 好きな初期値でOK
+        enemy.setdefault('max_hp', enemy['hp'])    # maxが無ければ今のhpを上限として扱う
+
+        # ---- 画像の選択 ----
         if enemy.get('dying'):
             a = max(0, min(255, int(enemy['alpha'])))
             nearest = min(ENEMY_FADE_LEVELS, key=lambda v: abs(v - a))
             img = enemy_fade_images[nearest]
         else:
             img = enemy_image
+
+        # ---- 位置（ワールド→画面）----s
+        # 敵の位置は左上基準（enemy['x'],['y']）なので、そのままオフセット
+        draw_x = int(enemy['x'] - bg_off_x)
+        draw_y = int(enemy['y'] - bg_off_y)
         screen.blit(img, (draw_x, draw_y))
+
+        # ---- HPの初期化（未設定の個体のみ）----
+        if 'hp' not in enemy:
+            enemy['max_hp'] = ENEMY_MAX_HP_DEFAULT
+            enemy['hp'] = enemy['max_hp']
+
+        # ---- HPバー（敵の頭上）----
+        # enemy['rect'] が左上基準の当たり判定Rectであることを前提
+        er = enemy.get('rect')
+        if er is None:
+            # 念のため保険：rectが無い個体は画像サイズから仮Rectを作る
+            er = pygame.Rect(int(enemy['x']), int(enemy['y']),
+                         img.get_width(), img.get_height())
+            enemy['rect'] = er
+
+        er_screen = er.move(-bg_off_x, -bg_off_y)
+        bar_w, bar_h = er.w, 5
+        bar_x = er_screen.x
+        bar_y = er_screen.y - (bar_h + 2)
+        draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h,
+                    enemy['hp'], enemy['max_hp'], fill=(255, 215, 0))
+
 
     # shortwave
     for wave in shortwaves:
@@ -1045,6 +1102,7 @@ def spawn_enemy():
         'rect': pygame.Rect(x, y, enemy_image.get_width(), enemy_image.get_height()),
         'x': x, 'y': y,
         'hp': enemy_base_hp,
+        'max_hp': enemy_base_hp,
         'atk': enemy_base_attack,
         'level': enemy_level, 
         'last_hits': {},
@@ -1881,6 +1939,10 @@ while running:
                             choice_waiting = False
                             selected_choice_idx = None
                             continue
+                        # 通常のpause中（俯瞰でない時）も O で俯瞰へ入る
+                    if event.key == pygame.K_o and not overlooking:
+                        enter_minimap()
+                        continue
 
                     # 通常のpause解除
                     if event.key in (pygame.K_ESCAPE, pygame.K_p):
@@ -2162,9 +2224,18 @@ while running:
                 elif event.key == pygame.K_p:
                     paused = not paused
                 elif event.key == pygame.K_o:
-                    # Oで「一時停止に入ってから」ミニマップON
+                    # Oでミニマップを開く／閉じる
                     if not paused:
                         paused = True
+                        enter_minimap()     # ★ これが肝
+                    else:
+                        if overlooking:
+                            # 既に俯瞰中なら閉じる
+                            exit_minimap()
+                            paused = False
+                        else:
+                            # ポーズ中かつ俯瞰でない → 俯瞰に入る
+                            enter_minimap()
                 if event.key == pygame.K_F1:
                     DEBUG_COLLISION_DRAW = not DEBUG_COLLISION_DRAW
 
@@ -2198,23 +2269,19 @@ while running:
 
         # ---- X軸
         nx = prev_x + dx + player_vx
-        test_rect_x = pygame.Rect(
-            int(nx - PLAYER_COLL_W // 2),
-            int(prev_y - PLAYER_COLL_H // 2 ),
-            PLAYER_COLL_W, PLAYER_COLL_H
-        )
-        if rect_collides_any(test_rect_x, border_blocks):
-            nx = prev_x
+        test_rect_x = pygame.Rect(int(nx - PLAYER_COLL_W/2), int(prev_y - PLAYER_COLL_H/2), PLAYER_COLL_W, PLAYER_COLL_H)
+        for br in border_blocks:
+            if test_rect_x.colliderect(br["rect"]):
+                nx = prev_x
+                break
 
         # ---- Y軸
         ny = prev_y + dy + player_vy
-        test_rect_y = pygame.Rect(
-            int(nx - PLAYER_COLL_W // 2),
-            int(ny - PLAYER_COLL_H // 2),
-            PLAYER_COLL_W, PLAYER_COLL_H
-        )
-        if rect_collides_any(test_rect_y, border_blocks):
-            ny = prev_y
+        test_rect_y = pygame.Rect(int(nx - PLAYER_COLL_W/2), int(ny - PLAYER_COLL_H/2), PLAYER_COLL_W, PLAYER_COLL_H)
+        for br in border_blocks:
+            if test_rect_y.colliderect(br["rect"]):
+                ny = prev_y
+                break
 
         # 確定
         player_x, player_y = nx, ny
@@ -2326,16 +2393,16 @@ while running:
             nx = ex_prev + step_x
             test_rect_x = pygame.Rect(int(nx), int(ey_prev), enemy['rect'].w, enemy['rect'].h)
             for br in border_blocks:
-                if test_rect_x.colliderect(br):
-                    nx = ex_prev  # X方向は進ませない
+                if test_rect_x.colliderect(br["rect"]):   # ← ここを修正
+                    nx = ex_prev
                     break
 
             # --- Y軸移動の衝突 ---
             ny = ey_prev + step_y
             test_rect_y = pygame.Rect(int(nx), int(ny), enemy['rect'].w, enemy['rect'].h)
             for br in border_blocks:
-                if test_rect_y.colliderect(br):
-                    ny = ey_prev  # Y方向は進ませない
+                if test_rect_y.colliderect(br["rect"]):   # ← ここを修正
+                    ny = ey_prev
                     break
 
             # 確定
