@@ -156,10 +156,18 @@ exp_image = pygame.transform.scale(exp_image, (20, 20))
 battery_image = pygame.image.load("battery.png").convert_alpha()
 battery_image = pygame.transform.scale(battery_image, (20, 20))
 
+#建築物
 # Portal
 portal_img = pygame.image.load("portal.png").convert_alpha()
 portal_img = pygame.transform.smoothscale(portal_img, (128, 160))
 PORTAL_W, PORTAL_H = portal_img.get_size()
+# ---- 壁ブロック（100x100）----
+BLOCK_SIZE = 100 #ブロックの大きさ
+block_img = pygame.image.load("block1.png").convert_alpha()
+block_img = pygame.transform.smoothscale(block_img, (BLOCK_SIZE, BLOCK_SIZE))
+
+# スポーンを囲うブロック群（ワールド座標のRectを保持）
+border_blocks = []
 
 #プレイヤー武器
 # short wave画像（オリジナル3000×3000を保持）
@@ -383,6 +391,7 @@ def enter_base_from_game():
 # ===============================
 # ゲーム描画
 # ===============================
+#===========背景の表示============
 #base背景スクロール
 def draw_tiled_bg(surface, texture, offset_x, offset_y):
     """texture を offset ずらしでタイル状に全面描画"""
@@ -549,7 +558,6 @@ def exit_minimap():
     TILE_W, TILE_H = NORMAL_TILE_W, NORMAL_TILE_H
     bg_ctx = bg_ctx_normal
 
-# 旧: def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th):
 def build_minimap_label_layer(base_gx, base_gy, cols, rows, tw, th,
                               center_lgx, center_lgy, ix_center, iy_center):
     """
@@ -616,6 +624,44 @@ minimap_cam_x = 0.0         # ミニマップ内カメラのXオフセット（p
 minimap_cam_y = 0.0         # ミニマップ内カメラのYオフセット（px）
 
 
+#=============建築物の描画====================
+def build_spawn_border(cx, cy, half=500): #halfで囲いの大きさを設定
+    """
+    スポーン中心 (cx, cy) を中心に、辺長 2*half の正方形を
+    50px ブロックで「外周」だけ埋める。返り値は Rect のリスト（ワールド座標）。
+    """
+    rects = []
+    s = BLOCK_SIZE
+    left   = cx - half
+    right  = cx + half - s
+    top    = cy - half
+    bottom = cy + half - s
+
+    # 上辺と下辺
+    x = left
+    while x <= right + 1:
+        rects.append(pygame.Rect(int(x), int(top), s, s))
+        rects.append(pygame.Rect(int(x), int(bottom), s, s))
+        x += s
+
+    # 左辺と右辺（角は重複しないように上下の内側だけ）
+    y = top + s
+    while y <= bottom - 1:
+        rects.append(pygame.Rect(int(left),  int(y), s, s))
+        rects.append(pygame.Rect(int(right), int(y), s, s))
+        y += s
+
+    return rects
+
+def rect_collides_any(r, rects):
+    """r が rects のどれかと衝突していれば True"""
+    # 小さな数ならこれで十分高速
+    for br in rects:
+        if r.colliderect(br):
+            return True
+    return False
+
+
 def draw_game(screen):
     global level_up_notice_rect
 
@@ -625,6 +671,12 @@ def draw_game(screen):
 
     # --- 背景を最初に描く（上書きしない）---
     draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
+
+    # === スポーン周りの壁ブロックを描画 ===
+    for br in border_blocks:
+        draw_x = br.x - player_x + PLAYER_DRAW_X
+        draw_y = br.y - player_y + PLAYER_DRAW_Y
+        screen.blit(block_img, (int(draw_x), int(draw_y)))
 
     # プレイヤー
     screen.blit(player_image, (PLAYER_DRAW_X, PLAYER_DRAW_Y))
@@ -756,11 +808,14 @@ def reset_game():
     global shortwaves, Weapon_shortwave_image, shortwave_base_w, shortwave_base_h, initial_scale, shortwave_level, weapon_shortwave_cooldown, weapon_shortwave_duration, weapon_shortwave_timer
     global game_speed, game_time, goel_time, game_clear
     global LEVELUP_PICK_COUNT
+    global border_blocks
 
     start_ticks = pygame.time.get_ticks()  # ← ゲーム開始時刻（ミリ秒）
 
     player_x, player_y = center_of_tile(0, 0, TILE_W, TILE_H)
     SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
+
+    border_blocks = build_spawn_border(SPAWN_CENTER_WX, SPAWN_CENTER_WY, half=500) #halfで囲いの大きさを設定
 
     LABEL_FONT = jp_font(14)   # ← ここで再初期化
     LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
@@ -1611,7 +1666,9 @@ while running:
         pygame.display.flip()
         clock.tick(60)
         continue  # ← 他の処理へ落ちないように
-
+#================
+#メインゲーム
+#================
     if not game_over and not game_clear:
         # === ESC確認ダイアログ（メインゲーム中のみ） ===
         if confirm_gameover:
@@ -2029,8 +2086,34 @@ while running:
             player_iframe -= 1
 
         # 移動
-        player_x += dx + player_vx
-        player_y += dy + player_vy
+        prev_x, prev_y = player_x, player_y
+
+        # ---- X軸
+        nx = prev_x + dx + player_vx
+        test_rect_x = pygame.Rect(
+            nx - player_image.get_width() // 2,
+            prev_y - player_image.get_height() // 2,
+            player_image.get_width(),
+            player_image.get_height()
+        )
+        if rect_collides_any(test_rect_x, border_blocks):
+            nx = prev_x  # 壁に当たったらX移動をキャンセル
+
+        # ---- Y軸
+        ny = prev_y + dy + player_vy
+        test_rect_y = pygame.Rect(
+            nx - player_image.get_width() // 2,
+            ny - player_image.get_height() // 2,
+            player_image.get_width(),
+            player_image.get_height()
+        )
+        if rect_collides_any(test_rect_y, border_blocks):
+            ny = prev_y  # 壁に当たったらY移動をキャンセル
+
+        # 確定
+        player_x, player_y = nx, ny
+
+        # プレイヤー矩形を更新
         player_rect = pygame.Rect(
             player_x - player_image.get_width() // 2,
             player_y - player_image.get_height() // 2,
