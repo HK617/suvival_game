@@ -158,7 +158,7 @@ battery_image = pygame.transform.scale(battery_image, (20, 20))
 
 # Portal
 portal_img = pygame.image.load("portal.png").convert_alpha()
-portal_img = pygame.transform.smoothscale(portal_img, (64, 80))
+portal_img = pygame.transform.smoothscale(portal_img, (128, 160))
 PORTAL_W, PORTAL_H = portal_img.get_size()
 
 #プレイヤー武器
@@ -348,9 +348,15 @@ def enter_base_from_game():
     global enemies, weapons, lasers, shortwaves, exp_items, battery_items
     global base_world_x, base_world_y, base_bg_scroll_x, base_bg_scroll_y
 
-    # ★ ベース座標を固定しておく
-    base_world_x = 450.0
-    base_world_y = 450.0
+
+        # ★ 存在しないときに備えて安全に初期化
+    if 'enemies' not in globals(): enemies = []
+    if 'weapons' not in globals(): weapons = []
+    if 'lasers' not in globals(): lasers = []
+    if 'shortwaves' not in globals(): shortwaves = []
+    if 'exp_items' not in globals(): exp_items = []
+    if 'battery_items' not in globals(): battery_items = []
+
     base_bg_scroll_x = 0.0
     base_bg_scroll_y = 0.0
 
@@ -374,37 +380,6 @@ def enter_base_from_game():
     base_bg_scroll_x = 0.0
     base_bg_scroll_y = 0.0
 
-# === 帰還アニメ用の状態 ===
-returning_to_base = False
-return_anim_time  = 0.0
-RETURN_ANIM_DURATION = 0.5  # 秒
-return_portal_wx = 0.0
-return_portal_wy = 0.0
-return_start_x = 0.0
-return_start_y = 0.0
-
-def start_return_to_base_anim(dx_last: float, dy_last: float):
-    """プレイヤーの少し前にポータルを出し、0.5秒で吸い込まれる演出を開始"""
-    global returning_to_base, return_anim_time
-    global return_portal_wx, return_portal_wy, return_start_x, return_start_y
-
-    # 直前の入力方向から前方オフセット（静止時は上向き）
-    if abs(dx_last) + abs(dy_last) < 1e-6:
-        dirx, diry = 0.0, -1.0
-    else:
-        d = (dx_last**2 + dy_last**2) ** 0.5
-        dirx, diry = dx_last / d, dy_last / d
-
-    OFFSET = 150.0  # 少し前
-    return_portal_wx = player_x + dirx * OFFSET
-    return_portal_wy = player_y + diry * OFFSET
-
-    return_start_x = player_x
-    return_start_y = player_y
-
-    return_anim_time = 0.0
-    returning_to_base = True
-
 # ===============================
 # ゲーム描画
 # ===============================
@@ -421,6 +396,15 @@ def draw_tiled_bg(surface, texture, offset_x, offset_y):
             surface.blit(texture, (x, y))
             y += th
         x += tw
+
+def base_world_to_screen(wx, wy):
+    """ベースのワールド座標 → 画面座標
+    ワールド: 上=+Y / スクリーン: 上=-Y なので、Yだけ符号が反転する
+    """
+    cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+    sx = cx + int(wx - base_world_x)
+    sy = cy - int(wy - base_world_y)   # ★ ここがポイント（マイナス）
+    return sx, sy
 
 
 # === 2D背景　===
@@ -728,7 +712,7 @@ def draw_game(screen):
     # UI
     font = jp_font(30)
     hp_text = font.render(f"HP: {player_hp}/{player_max_hp}", True, (255, 0, 0))
-    display_exp = min(exp, exp_to_next)
+    display_exp = min(int(exp), int(exp_to_next))
     level_text = font.render(f"Level: {level}  EXP: {display_exp}/{exp_to_next}", True, (0, 255, 0))
     battery_text = font.render(f"Battery: {battery}", True, (255, 255, 0))
     score_text = font.render(f"Score: {score}", True, (0, 255, 255))
@@ -1210,6 +1194,9 @@ player_speed = 5
 ENEMY_SPAWN_INTERVAL = 30
 MAX_ENEMIES = 250
 
+#プレイヤーの向きを初期化
+player_image_draw = player_image
+
 # フラグリスト
 running = True
 in_base = False
@@ -1225,6 +1212,8 @@ level_up_pending = False
 choice_waiting = False
 selected_choice_idx = None
 overlooking = False
+# メインゲーム中のESC確認ダイアログ表示フラグ
+confirm_gameover = False  
 
 # === ノックバック設定 ===
 KNOCKBACK_IMPULSE = 14.0   # 1回のヒットで与える押し返し量（好みで 10〜20）
@@ -1371,9 +1360,10 @@ while running:
                     # reset_game() は呼ばず、まず base へ入る
                     game_start = False
                     in_base = True
+                    base_world_x = 0
+                    base_world_y = 0
                     # ワールド原点に戻す
-                    base_world_x = 0.0
-                    base_world_y = 0.0
+                    enter_base_from_game() 
                 elif power_rect.collidepoint(event.pos):
                     power_up_screen = True
                     game_start = False
@@ -1405,40 +1395,68 @@ while running:
         if keys[pygame.K_a] or keys[pygame.K_LEFT]:
             dx -= BASE_SPEED
         if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-            dy += BASE_SPEED
-        if keys[pygame.K_w] or keys[pygame.K_UP]:
             dy -= BASE_SPEED
+        if keys[pygame.K_w] or keys[pygame.K_UP]:
+            dy += BASE_SPEED
 
-        base_world_x += dx
-        base_world_y += dy
+        # ---- ここから当たり判定（ブロック矩形＋開始円） ----
+        # 1) 目標物の定義（ワールド座標）
+        BLOCK_CX, BLOCK_CY = 0, 190   # 透明ブロックの中心
+        BLOCK_W, BLOCK_H   = 128, 120
+        PROMPT_CX, PROMPT_CY = 0, 120 # プロンプト円の中心
+        PROMPT_R = 20
 
-        # 到達チェック：ワールド座標(100,100) に“中央の自分”が重なったら開始
-        if abs(base_world_x - 100) <= 20 and abs(base_world_y - 100) <= 20:
-            reset_game()
-            in_base = False
-        
+        # 2) 軸分離でシンプルに衝突を止める（X→Yの順に適用）
+        prev_x, prev_y = base_world_x, base_world_y
+        nx = base_world_x + dx
+        ny = base_world_y + dy
+
+        # プレイヤー矩形サイズ（画像から）
+        p_w = player_original.get_width()
+        p_h = player_original.get_height()
+
+        # 透明ブロックの pygame.Rect（左上起点）
+        block_rect = pygame.Rect(
+            int(BLOCK_CX - BLOCK_W // 2),
+            int(BLOCK_CY - BLOCK_H // 2),
+            BLOCK_W, BLOCK_H
+        )
+
+        # --- X軸移動の衝突 ---
+        test_rect_x = pygame.Rect(int(nx - p_w/2), int(prev_y - p_h/2), p_w, p_h)
+        if test_rect_x.colliderect(block_rect):
+            nx = prev_x  # X方向は進ませない
+
+        # --- Y軸移動の衝突 ---
+        test_rect_y = pygame.Rect(int(nx - p_w/2), int(ny - p_h/2), p_w, p_h)
+        if test_rect_y.colliderect(block_rect):
+            ny = prev_y  # Y方向は進ませない
+
+        # 確定
+        base_world_x, base_world_y = nx, ny
+
+        # 3) プロンプト判定（円内なら表示）
+        dx_c = base_world_x - PROMPT_CX
+        dy_c = base_world_y - PROMPT_CY
+        show_start_prompt = (dx_c*dx_c + dy_c*dy_c) <= (PROMPT_R * PROMPT_R)
+
         # ★ 追加：ワールド座標(500,500) 到達で Power Up 画面を開く
-        if abs(base_world_x - 500) <= 20 and abs(base_world_y - 500) <= 20:
+        if abs(base_world_x - 500) <= 20 and abs(base_world_y - 0) <= 20:
             power_up_screen = True
             in_base = False
 
         # ===== 描画 =====
         # 背景をワールドオフセットでタイル描画（offsetが増えると左に流れる）
-        draw_tiled_bg(screen, bg_image, base_world_x, base_world_y)
+        draw_tiled_bg(screen, bg_image, base_world_x, -base_world_y)
 
-        # 目印：(100,100)
+         # 目印：(100,180)  ← 表示位置も合わせる
         center_x = SCREEN_WIDTH // 2
         center_y = SCREEN_HEIGHT // 2
-        target_screen_x = int(center_x + (100 - base_world_x))
-        target_screen_y = int(center_y + (100 - base_world_y))
-        # pygame.draw.circle(screen, (255, 0, 0), (target_screen_x, target_screen_y), 8, 2)  # ←不要ならコメントアウト
-        # ★ポータルを置く（画像の中心が座標になるように補正）
-        screen.blit(portal_img, (target_screen_x - PORTAL_W // 2, target_screen_y - PORTAL_H // 2))
+        px, py = base_world_to_screen(0, 180)
+        screen.blit(portal_img, (px - PORTAL_W // 2, py - PORTAL_H // 2))
 
-        # ★ 追加：目印：(500,500) ＝ Power Up ポイント（色を変える）
-        pu_screen_x = int(center_x + (500 - base_world_x))
-        pu_screen_y = int(center_y + (500 - base_world_y))
-        pygame.draw.circle(screen, (0, 128, 255), (pu_screen_x, pu_screen_y), 8, 2)
+        mx, my = base_world_to_screen(500, 0)
+        pygame.draw.circle(screen, (0, 128, 255), (mx, my), 8, 2)
 
         # プレイヤーは常に中央に描画（向きだけ入力で変える）
         if dx > 0:
@@ -1446,11 +1464,9 @@ while running:
         elif dx < 0:
             player_image_draw = pygame.transform.rotate(player_original, 90)
         elif dy > 0:
-            player_image_draw = pygame.transform.rotate(player_original, 180)
-        elif dy < 0:
             player_image_draw = player_original
-        else:
-            player_image_draw = player_image
+        elif dy < 0:
+            player_image_draw = pygame.transform.rotate(player_original, 180)
 
         screen.blit(
             player_image_draw,
@@ -1458,10 +1474,23 @@ while running:
              center_y - player_original.get_height() // 2)
         )
 
+        # ★ 「プレイを開始しますか？」の案内とFキーで開始
+        if show_start_prompt:
+            tip_font = jp_font(28)
+            tip = tip_font.render("プレイを開始しますか？（Fキー）", True, (0, 0, 0))
+            tip_x = SCREEN_WIDTH // 2 - tip.get_width() // 2
+            tip_y = SCREEN_HEIGHT // 2 + player_original.get_height() // 2 + 40
+            screen.blit(tip, (tip_x, tip_y))
+
+            if keys[pygame.K_f]:
+                reset_game()
+                in_base = False
+
+
         # デバッグ表示（任意）：いまのワールド座標
         font = jp_font(24)
         screen.blit(font.render(f"World Pos: ({int(base_world_x)}, {int(base_world_y)})", True, (0,0,0)), (10, 10))
-        screen.blit(font.render("Go to (100,100) to START", True, (0,0,0)), (10, 40))
+        screen.blit(font.render("ポータル下で Fキー で開始", True, (0,0,0)), (10, 40))
 
         pygame.display.flip()
         clock.tick(60)
@@ -1492,10 +1521,12 @@ while running:
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:  # ESCでベースに戻る
-                    power_up_screen = False
                     save_game_data()
-                    in_base = True
-                    game_start = False
+                    power_up_screen = False
+                    base_world_x -= 50
+                    base_world_y = 0
+                    enter_base_from_game()
+                    continue
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if upgrade1_rect.collidepoint(event.pos):
                     power_up_attack()   # 強化だけ行う（画面はそのまま）
@@ -1506,10 +1537,11 @@ while running:
                 elif upgrade4_rect.collidepoint(event.pos):
                     power_up_exp()
                 elif back_rect.collidepoint(event.pos):
-                    if event.key == pygame.K_ESCAPE:  # ESCでベースに戻る
                         save_game_data()
                         power_up_screen = False
-                        enter_base_from_game()  # ★ これで (450,450) に寄せる（下の②とセット）
+                        base_world_x -= 50
+                        base_world_y = 0
+                        enter_base_from_game()
                         continue
 
         label_font = jp_font(40)
@@ -1581,35 +1613,55 @@ while running:
         continue  # ← 他の処理へ落ちないように
 
     if not game_over and not game_clear:
-        # === 帰還アニメ中は専用の更新＆描画 ===
-        if returning_to_base:
-            delta_time = 1 / 60.0
-            return_anim_time += delta_time
-            t = min(1.0, return_anim_time / RETURN_ANIM_DURATION)
-
-            # 線形補間でプレイヤーをポータルへ吸い込む
-            global player_x, player_y
-            player_x = return_start_x + (return_portal_wx - return_start_x) * t
-            player_y = return_start_y + (return_portal_wy - return_start_y) * t
-
-            # 先に通常のゲーム画面を描く（敵などはそのままでOK）
+        # === ESC確認ダイアログ（メインゲーム中のみ） ===
+        if confirm_gameover:
+            # 背景に現状のゲーム画面を描く
             draw_game(screen)
 
-            # ポータルを“世界座標”から画面座標へ変換して重ね描き
-            pdx = return_portal_wx - player_x + PLAYER_DRAW_X
-            pdy = return_portal_wy - player_y + PLAYER_DRAW_Y
-            screen.blit(portal_img, (int(pdx - PORTAL_W // 2), int(pdy - PORTAL_H // 2)))
+            # 半透明の暗幕
+            dim = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            dim.fill((0, 0, 0, 160))
+            screen.blit(dim, (0, 0))
+
+            spacing = 60  # ボタン間隔
+            buttons_y = SCREEN_HEIGHT // 2 + 40
+            yes_rect = yes_button.get_rect(right=SCREEN_WIDTH // 2 - spacing // 2, top=buttons_y)
+            no_rect  = no_button.get_rect(left =SCREEN_WIDTH // 2 + spacing // 2, top=buttons_y)
+            screen.blit(yes_button, yes_rect)
+            screen.blit(no_button,  no_rect)
+
+            # 追加で文字を重ねてわかりやすく（画像にテキストが無い場合）
+            try:
+                font = jp_font(36)
+                msg  = font.render("ゲームを終了して GAME OVER にしますか？", True, (255,255,255))
+                screen.blit(msg, (SCREEN_WIDTH//2 - msg.get_width()//2, SCREEN_HEIGHT//2 - 60))
+            except:
+                pass
+
+            # ここ専用のイベント処理（ゲームは停止）
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE or event.key == pygame.K_n:
+                        # キャンセル
+                        confirm_gameover = False
+                    elif event.key == pygame.K_y or event.key == pygame.K_RETURN:
+                        # 確定→ゲームオーバーへ
+                        save_game_data()
+                        confirm_gameover = False
+                        game_over = True
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if yes_rect.collidepoint(event.pos):
+                        save_game_data()
+                        confirm_gameover = False
+                        game_over = True
+                    elif no_rect.collidepoint(event.pos):
+                        confirm_gameover = False
 
             pygame.display.flip()
             clock.tick(60)
-
-            if t >= 1.0:
-                # 演出完了 → 保存してベースへ
-                save_game_data()
-                enter_base_from_game()   # ← 座標(450,450)への移動もこの中で行う
-                returning_to_base = False
-
-            continue  # このフレームはここまで
+            continue  # このフレームは他の更新を行わない
         if paused:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1823,7 +1875,7 @@ while running:
             font = jp_font(40)
             hp_text = font.render(f"HP: {player_hp}/{player_max_hp}", True, (0, 0, 0))
             score_text = font.render(f"Score: {score}", True, (0, 0, 0))
-            display_exp = min(exp, exp_to_next)
+            display_exp = min(int(exp), int(exp_to_next))
             level_text = font.render(f"Level: {level}  EXP: {display_exp}/{exp_to_next}", True, (0, 0, 0))
             time_text = font.render(f"Time: {int(game_time)}", True, (0, 0, 0))
             real_time_text = font.render(f"Real Time: {real_time}", True, (0, 0, 0))
@@ -1930,13 +1982,9 @@ while running:
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:  # ESCキーで終了
-                    # 直近の入力ベクトルを使って“少し前”に出す
-                    keys_now = pygame.key.get_pressed()
-                    dx_last = (player_speed * game_speed) * ((1 if keys_now[pygame.K_d] else 0) - (1 if keys_now[pygame.K_a] else 0))
-                    dy_last = (player_speed * game_speed) * ((1 if keys_now[pygame.K_s] else 0) - (1 if keys_now[pygame.K_w] else 0))
-                    start_return_to_base_anim(dx_last, dy_last)
-                    continue 
+                if event.key == pygame.K_ESCAPE:  # ESCで確認ダイアログを開く
+                    confirm_gameover = True
+                    continue
                 elif event.key == pygame.K_DOWN:  # ↓キーでスピードダウン
                     if game_speed > 0.5:
                         game_speed = max(0.1, game_speed - 0.5)   # 0.5ずつ下がる
@@ -2423,7 +2471,9 @@ while running:
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if restart_rect.collidepoint(event.pos):
                     reset_game()
-                    save_game_data()          # 落ちる前に保存
+                    save_game_data()
+                    base_world_x = 0
+                    base_world_y = 0
                     enter_base_from_game()  
                     game_over = False
         # Game Over画面はここで1フレーム終わり。ループ継続。
