@@ -134,6 +134,14 @@ def available_choices():
 player_original = pygame.image.load("player.png").convert_alpha()
 player_original = pygame.transform.scale(player_original, (30, 30))
 player_image = player_original
+# プレイヤー当たり判定（描画と無関係の固定Hitbox）
+PLAYER_COLL_W = 30
+PLAYER_COLL_H = 30
+
+# 見た目中心と当たり判定中心の補正（+で右/下へ移動）
+# ※プレイヤーの赤枠が「左上」に寄って見えるなら、正の値を入れる
+HITBOX_OFFSET_X = 0
+HITBOX_OFFSET_Y = 0
 
 # プレイヤー描画位置（常に中央）
 PLAYER_DRAW_X = SCREEN_WIDTH // 2 - player_original.get_width() // 2
@@ -162,7 +170,7 @@ portal_img = pygame.image.load("portal.png").convert_alpha()
 portal_img = pygame.transform.smoothscale(portal_img, (128, 160))
 PORTAL_W, PORTAL_H = portal_img.get_size()
 # ---- 壁ブロック（100x100）----
-BLOCK_SIZE = 100 #ブロックの大きさ
+BLOCK_SIZE = 50 #ブロックの大きさ
 block_img = pygame.image.load("block1.png").convert_alpha()
 block_img = pygame.transform.smoothscale(block_img, (BLOCK_SIZE, BLOCK_SIZE))
 
@@ -674,12 +682,59 @@ def draw_game(screen):
 
     # === スポーン周りの壁ブロックを描画 ===
     for br in border_blocks:
-        draw_x = br.x - player_x + PLAYER_DRAW_X
-        draw_y = br.y - player_y + PLAYER_DRAW_Y
-        screen.blit(block_img, (int(draw_x), int(draw_y)))
+        # ワールドRect → 画面Rectへ移動（プレイヤー中心カメラ）
+        screen_rect = br.move(-player_x + PLAYER_DRAW_X, -player_y + PLAYER_DRAW_Y)
+        # 画像をRectの左上にピッタリ置く
+        screen.blit(block_img, screen_rect.topleft)
+
+    # （デバッグ）当たり判定の枠を表示したいとき
+    # pygame.draw.rect(screen, (255, 0, 0), screen_rect, 1)
+        # --- デバッグ: 当たり判定の可視化 ---
+    if DEBUG_COLLISION_DRAW:
+        # ブロックの矩形（緑）
+        for br in border_blocks:
+            r = pygame.Rect(
+                int(br.x - bg_off_x),
+                int(br.y - bg_off_y),
+                br.w, br.h
+            )
+            pygame.draw.rect(screen, (0, 255, 0), r, 2)
+
+        # プレイヤーの矩形（赤）
+        screen_cx = player_x - bg_off_x
+        screen_cy = player_y - bg_off_y
+        pr = pygame.Rect(
+            int(screen_cx - PLAYER_COLL_W // 2 + HITBOX_OFFSET_X),
+            int(screen_cy - PLAYER_COLL_H // 2 + HITBOX_OFFSET_Y),
+            PLAYER_COLL_W, PLAYER_COLL_H
+        )
+        pygame.draw.rect(screen, (255, 0, 0), pr, 2)
+
+        # 敵の当たり判定（黄色）
+        for en in enemies:
+            if 'rect' not in en:
+                continue
+            er = en['rect']
+            # ワールド→画面
+            er_screen = pygame.Rect(
+                int(er.x - bg_off_x),
+                int(er.y - bg_off_y),
+                er.w, er.h
+            )
+            pygame.draw.rect(screen, (255, 215, 0), er_screen, 2)  # Yellow
+
+            # 中心マーカー（任意：見やすくするため）
+            cx = er_screen.centerx
+            cy = er_screen.centery
+            pygame.draw.line(screen, (255, 215, 0), (cx - 6, cy), (cx + 6, cy), 1)
+            pygame.draw.line(screen, (255, 215, 0), (cx, cy - 6), (cx, cy + 6), 1)
+
 
     # プレイヤー
-    screen.blit(player_image, (PLAYER_DRAW_X, PLAYER_DRAW_Y))
+    # プレイヤー画像の中心を常に画面中央に置く
+    player_draw_x = SCREEN_WIDTH // 2 - player_image.get_width() // 2 - 15
+    player_draw_y = SCREEN_HEIGHT // 2 - player_image.get_height() // 2 - 15
+    screen.blit(player_image, (player_draw_x, player_draw_y))
 
     if overlooking:
         pygame.draw.circle(screen, (255, 0, 0), (PLAYER_DRAW_X + 15, PLAYER_DRAW_Y + 15), 6)
@@ -1270,6 +1325,11 @@ overlooking = False
 # メインゲーム中のESC確認ダイアログ表示フラグ
 confirm_gameover = False  
 
+DEBUG_COLLISION_DRAW = False
+
+# === Base（待機ルーム）用デバッグ表示 ===
+DEBUG_BASE_DRAW = False
+
 # === ノックバック設定 ===
 KNOCKBACK_IMPULSE = 14.0   # 1回のヒットで与える押し返し量（好みで 10〜20）
 KNOCKBACK_DECAY   = 0.88   # 毎フレームの減衰（0.85〜0.93 くらいが無難）
@@ -1441,6 +1501,8 @@ while running:
                 if event.key == pygame.K_ESCAPE:
                     in_base = False
                     game_start = True
+                elif event.key == pygame.K_F1:
+                    DEBUG_BASE_DRAW = not DEBUG_BASE_DRAW
 
         # 入力（ワールド座標を更新：右に進む=世界を左へ流すのと同義）
         keys = pygame.key.get_pressed()
@@ -1546,6 +1608,51 @@ while running:
         font = jp_font(24)
         screen.blit(font.render(f"World Pos: ({int(base_world_x)}, {int(base_world_y)})", True, (0,0,0)), (10, 10))
         screen.blit(font.render("ポータル下で Fキー で開始", True, (0,0,0)), (10, 40))
+
+                # ★ 追加: Base用デバッグ可視化
+        if DEBUG_BASE_DRAW:
+            # 画面中心（プレイヤー描画位置は常にここ）
+            cx = SCREEN_WIDTH // 2
+            cy = SCREEN_HEIGHT // 2
+
+            # プレイヤーの当たり判定（見た目基準。Baseでは画像と同じ大きさでOK）
+            p_w = player_original.get_width()
+            p_h = player_original.get_height()
+            player_rect_screen = pygame.Rect(cx - p_w // 2, cy - p_h // 2, p_w, p_h)
+            pygame.draw.rect(screen, (255, 0, 0), player_rect_screen, 2)  # 赤: プレイヤー
+
+            # 透明ブロック（ワールド定義）
+            BLOCK_CX, BLOCK_CY = 0, 190
+            BLOCK_W, BLOCK_H   = 128, 120
+            left = BLOCK_CX - BLOCK_W // 2
+            top  = BLOCK_CY - BLOCK_H // 2
+            sx, sy = base_world_to_screen(left, top)
+            block_rect_screen = pygame.Rect(sx, sy, BLOCK_W, BLOCK_H)
+            pygame.draw.rect(screen, (0, 255, 0), block_rect_screen, 2)  # 緑: 透明ブロック
+
+            # ポータル矩形（画像基準）
+            portal_left  = 0 - PORTAL_W // 2
+            portal_top   = 180 - PORTAL_H // 2
+            psx, psy = base_world_to_screen(portal_left, portal_top)
+            portal_rect_screen = pygame.Rect(psx, psy, PORTAL_W, PORTAL_H)
+            pygame.draw.rect(screen, (0, 0, 255), portal_rect_screen, 2)  # 青: ポータル
+
+            # 開始プロンプト円（Fキー判定位置）
+            PROMPT_CX, PROMPT_CY = 0, 120
+            PROMPT_R = 20
+            pcx, pcy = base_world_to_screen(PROMPT_CX, PROMPT_CY)
+            pygame.draw.circle(screen, (0, 128, 255), (pcx, pcy), PROMPT_R, 2)  # 水色: 開始円
+
+            # 原点十字（任意）
+            ox, oy = base_world_to_screen(0, 0)
+            pygame.draw.line(screen, (200, 0, 200), (ox - 10, oy), (ox + 10, oy), 2)
+            pygame.draw.line(screen, (200, 0, 200), (ox, oy - 10), (ox, oy + 10), 2)
+
+            # 軽い注記
+            info_font = jp_font(18)
+            screen.blit(info_font.render("F2: Base Debug ON", True, (0, 0, 0)), (10, 70))
+            screen.blit(info_font.render("Red=Player  Green=Block  Blue=Portal  Cyan=StartCircle", True, (0, 0, 0)), (10, 92))
+
 
         pygame.display.flip()
         clock.tick(60)
@@ -2058,7 +2165,8 @@ while running:
                     # Oで「一時停止に入ってから」ミニマップON
                     if not paused:
                         paused = True
-                    enter_minimap()
+                if event.key == pygame.K_F1:
+                    DEBUG_COLLISION_DRAW = not DEBUG_COLLISION_DRAW
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
             # 「level up available」の文字が押されたらポーズを開く
@@ -2091,35 +2199,33 @@ while running:
         # ---- X軸
         nx = prev_x + dx + player_vx
         test_rect_x = pygame.Rect(
-            nx - player_image.get_width() // 2,
-            prev_y - player_image.get_height() // 2,
-            player_image.get_width(),
-            player_image.get_height()
+            int(nx - PLAYER_COLL_W // 2),
+            int(prev_y - PLAYER_COLL_H // 2 ),
+            PLAYER_COLL_W, PLAYER_COLL_H
         )
         if rect_collides_any(test_rect_x, border_blocks):
-            nx = prev_x  # 壁に当たったらX移動をキャンセル
+            nx = prev_x
 
         # ---- Y軸
         ny = prev_y + dy + player_vy
         test_rect_y = pygame.Rect(
-            nx - player_image.get_width() // 2,
-            ny - player_image.get_height() // 2,
-            player_image.get_width(),
-            player_image.get_height()
+            int(nx - PLAYER_COLL_W // 2),
+            int(ny - PLAYER_COLL_H // 2),
+            PLAYER_COLL_W, PLAYER_COLL_H
         )
         if rect_collides_any(test_rect_y, border_blocks):
-            ny = prev_y  # 壁に当たったらY移動をキャンセル
+            ny = prev_y
 
         # 確定
         player_x, player_y = nx, ny
-
-        # プレイヤー矩形を更新
+        
+        # 最終的なプレイヤー判定Rect（他の衝突にもこれを使う）
         player_rect = pygame.Rect(
-            player_x - player_image.get_width() // 2,
-            player_y - player_image.get_height() // 2,
-            player_image.get_width(),
-            player_image.get_height()
+            int(player_x - PLAYER_COLL_W // 2),
+            int(player_y - PLAYER_COLL_H // 2),
+            PLAYER_COLL_W, PLAYER_COLL_H
         )
+
 
         # 向き変更
         if dx > 0:
@@ -2195,26 +2301,47 @@ while running:
         lasers = lasers_to_keep
         # weapons の laser を更新
         weapons = [w for w in weapons if w["type"] != "laser"] + new_weapons      
-        # 敵の移動と衝突判定
+
+        # 敵の移動と衝突判定（ブロックにも当たる）
         for enemy in enemies:
-            # 直前中心位置を保存（トンネリング対策用）
+            # 直前中心位置（レーザー掃引やノックバック等で使う）
             enemy['prev_cx'] = enemy['rect'].centerx
             enemy['prev_cy'] = enemy['rect'].centery
 
-            # プレイヤー中心へ追尾（player_x, player_y は中心座標）
-            target_x = player_x
-            target_y = player_y
-            enemy_center_x = enemy['x'] + enemy_image.get_width() // 2
-            enemy_center_y = enemy['y'] + enemy_image.get_height() // 2
+            # 追尾ベクトル（enemy['x'],['y'] は左上基準）
+            ex_prev, ey_prev = enemy['x'], enemy['y']
+            cx_enemy = ex_prev + enemy['rect'].w * 0.5
+            cy_enemy = ey_prev + enemy['rect'].h * 0.5
 
-            dx_enemy = target_x - enemy_center_x
-            dy_enemy = target_y - enemy_center_y
-            dist = (dx_enemy**2 + dy_enemy**2)**0.5
+            dx_enemy = player_x - cx_enemy
+            dy_enemy = player_y - cy_enemy
+            dist = math.hypot(dx_enemy, dy_enemy)
             if dist > 0:
-                enemy['x'] += (dx_enemy / dist) * enemy_speed * game_speed
-                enemy['y'] += (dy_enemy / dist) * enemy_speed * game_speed
-                enemy['rect'].x = int(enemy['x'])
-                enemy['rect'].y = int(enemy['y'])
+                step_x = (dx_enemy / dist) * enemy_speed * game_speed
+                step_y = (dy_enemy / dist) * enemy_speed * game_speed
+            else:
+                step_x = step_y = 0.0
+
+            # --- X軸移動の衝突 ---
+            nx = ex_prev + step_x
+            test_rect_x = pygame.Rect(int(nx), int(ey_prev), enemy['rect'].w, enemy['rect'].h)
+            for br in border_blocks:
+                if test_rect_x.colliderect(br):
+                    nx = ex_prev  # X方向は進ませない
+                    break
+
+            # --- Y軸移動の衝突 ---
+            ny = ey_prev + step_y
+            test_rect_y = pygame.Rect(int(nx), int(ny), enemy['rect'].w, enemy['rect'].h)
+            for br in border_blocks:
+                if test_rect_y.colliderect(br):
+                    ny = ey_prev  # Y方向は進ませない
+                    break
+
+            # 確定
+            enemy['x'], enemy['y'] = nx, ny
+            enemy['rect'].x = int(nx)
+            enemy['rect'].y = int(ny)
 
         # 全員動かし終わってから1回だけ、重なり解消
         resolve_enemy_collisions(enemies)
