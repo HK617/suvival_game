@@ -174,6 +174,24 @@ BLOCK_SIZE = 50 #ブロックの大きさ
 block_img = pygame.image.load("block1.png").convert_alpha()
 block_img = pygame.transform.smoothscale(block_img, (BLOCK_SIZE, BLOCK_SIZE))
 
+# ★ ドア画像（閉/開）を読み込んで同サイズに揃える
+door_closed_img = pygame.image.load("close_door.png").convert_alpha()
+door_closed_img = pygame.transform.smoothscale(door_closed_img, (BLOCK_SIZE, BLOCK_SIZE))
+door_open_img = pygame.image.load("open_door.png").convert_alpha()
+door_open_img  = pygame.transform.smoothscale(door_open_img,  (BLOCK_SIZE, BLOCK_SIZE))
+# ★ ドアの最大HP
+DOOR_MAX_HP = 200
+
+# 画像コード（短縮保存用）
+IMG_CODE = {"block1.png": "0", "close_door.png": "1", "open_door.png": "2"}
+CODE_IMG = {v: k for k, v in IMG_CODE.items()}
+# ★ ブロック画像レジストリ
+BLOCK_IMAGES = {
+    "block1.png":    block_img,
+    "close_door.png": door_closed_img,
+    "open_door.png":  door_open_img,
+}
+
 # スポーンを囲うブロック群（ワールド座標のRectを保持）
 border_blocks = []
 
@@ -228,8 +246,10 @@ def jp_font(size):
 def load_game_data():
     global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
     global BG_RANDOM_SEED, EXPLORED_TILES
+    global SAVED_BLOCKS_LAYOUT   # ★ 追加
 
-    # まずは安全なデフォルト（上で定義済みだが、明示再設定しておくと安心）
+    SAVED_BLOCKS_LAYOUT = None   # デフォルト
+
     pad, psp, pmh, pexp, bat = 1, 5, 10, 1, 0
     seed_default = BG_RANDOM_SEED
 
@@ -243,17 +263,15 @@ def load_game_data():
                 persistent_maxhp_bonus  = int(data.get("persistent_maxhp_bonus",  pmh))
                 persistent_exp_bonus    = float(data.get("persistent_exp_bonus",  pexp))
                 battery                 = int(data.get("battery",                  bat))
+                BG_RANDOM_SEED          = int(data.get("bg_seed", seed_default))
 
-                # シード
-                BG_RANDOM_SEED = int(data.get("bg_seed", seed_default))
-
-                # explored_tiles は新旧両対応
+                # explored_tiles（既存）
                 explored_data = data.get("explored_tiles", "")
                 EXPLORED_TILES = set()
                 if isinstance(explored_data, str):
                     for token in explored_data.split(";"):
                         token = token.strip()
-                        if not token: 
+                        if not token:
                             continue
                         gx_str, gy_str = token.split(",")
                         EXPLORED_TILES.add((int(gx_str), int(gy_str)))
@@ -263,10 +281,17 @@ def load_game_data():
                             gx, gy = pair
                             EXPLORED_TILES.add((int(gx), int(gy)))
 
+                # ★ 新規: ブロック配置（短縮・互換）
+                blocks_compact = data.get("blocks_compact")
+                blocks_data    = data.get("blocks")
+
+                SAVED_BLOCKS_LAYOUT = None
+                if isinstance(blocks_compact, str) and blocks_compact:
+                    SAVED_BLOCKS_LAYOUT = decode_blocks(blocks_compact)
+
                 print("セーブデータを読み込みました。")
 
             except json.JSONDecodeError:
-                # 空ファイル/壊れたJSON → 完全初期化
                 persistent_attack_bonus = pad
                 persistent_speed_bonus  = psp
                 persistent_maxhp_bonus  = pmh
@@ -274,9 +299,9 @@ def load_game_data():
                 battery                 = bat
                 BG_RANDOM_SEED          = seed_default
                 EXPLORED_TILES          = set()
+                SAVED_BLOCKS_LAYOUT     = None
                 print("セーブファイルが壊れています。初期値で続行します。")
     else:
-        # ファイルが無い → 初期値
         persistent_attack_bonus = pad
         persistent_speed_bonus  = psp
         persistent_maxhp_bonus  = pmh
@@ -284,6 +309,7 @@ def load_game_data():
         battery                 = bat
         BG_RANDOM_SEED          = seed_default
         EXPLORED_TILES          = set()
+        SAVED_BLOCKS_LAYOUT     = None
         print("セーブファイルが見つかりません。初期値で開始します。")
 
 
@@ -291,18 +317,24 @@ def load_game_data():
 # セーブデータの保存
 # ===============================
 def save_game_data():
-    # 探索済みを "gx,gy;gx,gy;..." の文字列に変換
+    # 探索済みを "gx,gy;..." へ
     explored_str = ";".join(f"{gx},{gy}" for gx, gy in EXPLORED_TILES)
+
+    # ★ ブロック保存（超短縮）
+    try:
+        blocks_compact = encode_blocks(border_blocks)
+    except Exception:
+        blocks_compact = ""
 
     data = {
         "persistent_attack_bonus": persistent_attack_bonus,
-        "persistent_speed_bonus": persistent_speed_bonus,
-        "persistent_maxhp_bonus": persistent_maxhp_bonus,
-        "persistent_exp_bonus": persistent_exp_bonus,
-        "battery": battery,
-        "bg_seed": BG_RANDOM_SEED,
-        # ★ 短く保存
-        "explored_tiles": explored_str,
+        "persistent_speed_bonus":  persistent_speed_bonus,
+        "persistent_maxhp_bonus":  persistent_maxhp_bonus,
+        "persistent_exp_bonus":    persistent_exp_bonus,
+        "battery":                 battery,
+        "bg_seed":                 BG_RANDOM_SEED,
+        "explored_tiles":          explored_str,
+        "blocks_compact":          blocks_compact,
     }
 
     with open(SAVE_FILE, "w", encoding="utf-8") as f:
@@ -700,6 +732,115 @@ def get_current_spawn_tile_rect():
     bottom = int(tile_bottom - h * 0.5)
     return pygame.Rect(left, top, right - left, bottom - top)
 
+# 建築物の保存
+def make_block_from_xy(x, y, img="block1.png", hp=100, collidable=True, door_state=None):
+    """保存データ→実体化 / 既定作成用の共通フォーマット"""
+    b = {
+        "rect": pygame.Rect(int(x), int(y), BLOCK_SIZE, BLOCK_SIZE),
+        "img": img,
+        "collidable": bool(collidable),
+        "door_state": door_state,  # None / "closed" / "open"
+        "hp": int(hp),
+        "max_hp": int(hp),
+    }
+    # ドアはHP不要にする（飾り）
+    if b["door_state"] is not None:
+        b["hp"] = b["max_hp"] = 0
+    return b
+
+
+def encode_blocks(blocks):
+    """
+    ブロック群を超短い文字列に圧縮:
+      1エントリ = "x,y,t[,hp]"
+      ・t は 0=壁, 1=閉ドア, 2=開ドア
+      ・hp は“既定値”なら省略（壁=100, 閉ドア=DOOR_MAX_HP, 開ドア=0）
+      ・エントリ区切りは ';'
+    """
+    parts = []
+    for br in blocks:
+        r = br["rect"]
+        x, y = r.x, r.y
+        img = br.get("img", "block1.png")
+        t = IMG_CODE.get(img, "0")
+
+        hp = int(br.get("hp", 100))
+        default_hp = 100 if t == "0" else (DOOR_MAX_HP if t == "1" else 0)
+
+        if hp == default_hp:
+            parts.append(f"{x},{y},{t}")
+        else:
+            parts.append(f"{x},{y},{t},{hp}")
+    return ";".join(parts)
+
+
+def decode_blocks(compact: str):
+    """
+    encode_blocks で作った文字列をブロック配列に戻す。
+    collidable/door_state は img & hp から自動導出。
+    """
+    if not compact:
+        return []
+
+    out = []
+    for entry in compact.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        fields = entry.split(",")
+        # x,y,t[,hp]
+        if len(fields) < 3:
+            continue
+        x = int(fields[0]); y = int(fields[1]); t = fields[2]
+        img = CODE_IMG.get(t, "block1.png")
+
+        # 既定HP
+        default_hp = 100 if t == "0" else (DOOR_MAX_HP if t == "1" else 0)
+        hp = int(fields[3]) if len(fields) >= 4 else default_hp
+
+        # 派生プロパティ
+        if t == "1" and hp > 0:
+            door_state = "closed"
+            collidable = True
+        elif t == "2":
+            door_state = "open"
+            collidable = False
+        else:
+            door_state = None
+            collidable = (hp > 0)
+
+        out.append({
+            "rect": pygame.Rect(int(x), int(y), BLOCK_SIZE, BLOCK_SIZE),
+            "img": img,
+            "collidable": collidable,
+            "door_state": door_state,
+            "hp": hp,
+            "max_hp": hp if door_state is None else (DOOR_MAX_HP if door_state == "closed" else 0),
+        })
+    return out
+
+
+def default_border_blocks_with_door(cx, cy, half=500, hp=100):
+    raw = build_spawn_border(cx, cy, half=half, block_hp=hp)
+    for br in raw:
+        br["img"] = "block1.png"
+        br["collidable"] = True
+        br["door_state"] = None
+
+    # 中央下に最も近いブロックをドアに
+    target_x, target_y = cx, cy + half - BLOCK_SIZE // 2
+    door_idx = min(
+        range(len(raw)),
+        key=lambda i: (raw[i]["rect"].centerx - target_x) ** 2 + (raw[i]["rect"].centery - target_y) ** 2
+    )
+    raw[door_idx]["img"] = "close_door.png"
+    raw[door_idx]["door_state"] = "closed"
+
+    # ★ ここを変更：閉じている間はHPあり＆衝突あり（開いたらHPゼロ化＆衝突OFFにする）
+    raw[door_idx]["hp"] = DOOR_MAX_HP
+    raw[door_idx]["max_hp"] = DOOR_MAX_HP
+    raw[door_idx]["collidable"] = True
+    return raw
 
 
 def draw_game(screen):
@@ -712,19 +853,23 @@ def draw_game(screen):
     # --- 背景を最初に描く（上書きしない）---
     draw_bg(screen, bg_ctx, bg_off_x, bg_off_y, BG_RANDOM_SEED)
 
-    # === スポーン周りの壁ブロックを描画 ===
     # === ブロック描画（画像） ===
     for br in border_blocks:
         r = br["rect"]
         screen_rect = r.move(-bg_off_x, -bg_off_y)
-        screen.blit(block_img, screen_rect.topleft)
 
-        # HPバー（ブロックの上に表示）
-        bw = r.w
-        bar_w, bar_h = bw, 6
-        bar_x = screen_rect.x
-        bar_y = screen_rect.y - (bar_h + 2)
-        draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h, br["hp"], br["max_hp"], fill=(200,80,80))
+        # ★ 画像は個々の設定に従う
+        img_key = br.get("img", "block1.png")
+        img = BLOCK_IMAGES.get(img_key, block_img)
+        screen.blit(img, screen_rect.topleft)
+
+        # ★ ドアや非衝突ブロックはHPバーを出さない
+        if br.get("collidable", True) and br.get("max_hp", 0) > 0:
+            bw = r.w
+            bar_w, bar_h = bw, 6
+            bar_x = screen_rect.x
+            bar_y = screen_rect.y - (bar_h + 2)
+            draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h, br.get("hp", 0), br.get("max_hp", 0), fill=(200,80,80))
 
 
     # （デバッグ）当たり判定の枠を表示したいとき
@@ -1044,7 +1189,16 @@ def reset_game():
     player_x, player_y = center_of_tile(0, 0, TILE_W, TILE_H)
     SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
 
-    border_blocks = build_spawn_border(SPAWN_CENTER_WX, SPAWN_CENTER_WY, half=500) #halfで囲いの大きさを設定
+    # ★ ブロック配置：savedataにあればそれを使い、無ければ既定形＋ドアを作る
+    if 'SAVED_BLOCKS_LAYOUT' in globals() and SAVED_BLOCKS_LAYOUT:
+        border_blocks = SAVED_BLOCKS_LAYOUT
+    else:
+        border_blocks = default_border_blocks_with_door(SPAWN_CENTER_WX, SPAWN_CENTER_WY, half=500, hp=100)
+        # 初回に既定配置を保存しておく（以後はロードで再現される）
+        try:
+            save_game_data()
+        except Exception:
+            pass
 
     # ★ここでPORTALSを更新（いまは1個）
     PORTALS = [{
@@ -2537,7 +2691,22 @@ while running:
         nx = prev_x + dx + player_vx
         test_rect_x = pygame.Rect(int(nx - PLAYER_COLL_W/2), int(prev_y - PLAYER_COLL_H/2), PLAYER_COLL_W, PLAYER_COLL_H)
         for br in border_blocks:
+            if not br.get("collidable", True):
+                continue
             if test_rect_x.colliderect(br["rect"]):
+                # ★ 閉じたドアに当たったら即オープンして通す
+                if br.get("door_state") == "closed":
+                    br["door_state"] = "open"
+                    br["img"] = "open_door.png"
+                    br["collidable"] = False
+                    br["hp"] = br["max_hp"] = 0  # 開いたらHP表示なし
+                    try:
+                        save_game_data()
+                    except Exception:
+                        pass
+                    # ドアを開いたのでブロックとしては「当たり扱いしない」
+                    continue
+                # 通常の壁は止める
                 nx = prev_x
                 break
 
@@ -2545,7 +2714,20 @@ while running:
         ny = prev_y + dy + player_vy
         test_rect_y = pygame.Rect(int(nx - PLAYER_COLL_W/2), int(ny - PLAYER_COLL_H/2), PLAYER_COLL_W, PLAYER_COLL_H)
         for br in border_blocks:
+            if not br.get("collidable", True):
+                continue
             if test_rect_y.colliderect(br["rect"]):
+                # ★ 閉じたドアに当たったら即オープンして通す
+                if br.get("door_state") == "closed":
+                    br["door_state"] = "open"
+                    br["img"] = "open_door.png"
+                    br["collidable"] = False
+                    br["hp"] = br["max_hp"] = 0
+                    try:
+                        save_game_data()
+                    except Exception:
+                        pass
+                    continue
                 ny = prev_y
                 break
 
@@ -2558,6 +2740,20 @@ while running:
             int(player_y - PLAYER_COLL_H // 2),
             PLAYER_COLL_W, PLAYER_COLL_H
         )
+        # ★ ドア（閉）に触れたら“開く”：画像差し替え＆衝突OFF → ついでに保存
+        door_opened = False
+        for br in border_blocks:
+            if br.get("door_state") == "closed" and player_rect.colliderect(br["rect"]):
+                br["door_state"] = "open"
+                br["img"] = "open_door.png"
+                br["collidable"] = False
+                br["hp"] = br["max_hp"] = 0
+                door_opened = True
+        if door_opened:
+            try:
+                save_game_data()
+            except Exception:
+                pass
 
 
         # 向き変更
@@ -2682,20 +2878,25 @@ while running:
             hit_block = False
             hit_block_br = None
             for br in border_blocks:
+                if not br.get("collidable", True):
+                    continue
                 if test_rect_x.colliderect(br["rect"]):
                     nx = ex_prev
                     hit_block = True
-                    hit_block_br = br    # ← どのブロックに当たったか保持
+                    hit_block_br = br
                     break
 
-            # --- Y軸移動の衝突 ---
+
+            # 敵の --- Y軸移動の衝突 ---
             ny = ey_prev + step_y
             test_rect_y = pygame.Rect(int(nx), int(ny), enemy['rect'].w, enemy['rect'].h)
             for br in border_blocks:
+                if not br.get("collidable", True):   # ★ これを追加
+                    continue
                 if test_rect_y.colliderect(br["rect"]):
                     ny = ey_prev
                     hit_block = True
-                    hit_block_br = br    # ← こちら側で当たるケースも保持
+                    hit_block_br = br
                     break
 
             # 確定
