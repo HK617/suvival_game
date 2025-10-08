@@ -679,6 +679,28 @@ def draw_hp_bar(surf, x, y, w, h, hp, max_hp, back=(60,60,60), fill=(0,200,0), b
     # 枠
     pygame.draw.rect(surf, border, (x, y, w, h), 1)
 
+# デバックモードの表示
+# 敵のスポーン範囲の表示
+def get_current_spawn_tile_rect():
+    """プレイヤーがいる“論理タイル”内で、敵をランダムサンプルしている矩形（ワールド座標）を返す"""
+    w, h = enemy_image.get_width(), enemy_image.get_height()
+
+    pgx, pgy = spawn_rel_tile(player_x, player_y)   # 現在のタイル番号
+    tile_cx, tile_cy = center_of_tile(pgx, pgy, TILE_W, TILE_H)
+
+    tile_left   = tile_cx - TILE_W // 2
+    tile_right  = tile_cx + TILE_W // 2
+    tile_top    = tile_cy - TILE_H // 2
+    tile_bottom = tile_cy + TILE_H // 2
+
+    # 敵スプライトが収まる内側（spawn_enemy と同じ）
+    left   = int(tile_left   + w * 0.5)
+    right  = int(tile_right  - w * 0.5)
+    top    = int(tile_top    + h * 0.5)
+    bottom = int(tile_bottom - h * 0.5)
+    return pygame.Rect(left, top, right - left, bottom - top)
+
+
 
 def draw_game(screen):
     global level_up_notice_rect
@@ -743,6 +765,38 @@ def draw_game(screen):
             cy = er_screen.centery
             pygame.draw.line(screen, (255, 215, 0), (cx - 6, cy), (cx + 6, cy), 1)
             pygame.draw.line(screen, (255, 215, 0), (cx, cy - 6), (cx, cy + 6), 1)
+        
+        # --- 敵スポーン範囲の可視化（F1デバッグ時） ---
+        spawn_rect_world = get_current_spawn_tile_rect()
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+
+        # サンプリング領域（赤）
+        sr_screen = pygame.Rect(
+            spawn_rect_world.x - bg_off_x,
+            spawn_rect_world.y - bg_off_y,
+            spawn_rect_world.w,
+            spawn_rect_world.h
+        )
+        pygame.draw.rect(overlay, (255, 0, 0, 60), sr_screen)       # 塗り
+        pygame.draw.rect(overlay, (255, 0, 0, 180), sr_screen, 2)   # 枠
+
+        # ポータル禁止半径（青）
+        portals = list_portals()
+        PORTAL_SAFE_RADIUS = max(PORTAL_W, PORTAL_H) // 2 + 100
+        for p in portals:
+            px, py = p["rect"].center
+            cx = int(px - bg_off_x)
+            cy = int(py - bg_off_y)
+            pygame.draw.circle(overlay, (0, 128, 255, 50), (cx, cy), PORTAL_SAFE_RADIUS)
+            pygame.draw.circle(overlay, (0, 128, 255, 160), (cx, cy), PORTAL_SAFE_RADIUS, 2)
+
+        # 合成
+        screen.blit(overlay, (0, 0))
+
+        # ラベル（下部に表示）
+        help_font = jp_font(20)
+        txt = help_font.render("F1: Debug ON  （赤=スポーン範囲 / 青=ポータル禁止半径）", True, (0,0,0))
+        screen.blit(txt, (10, SCREEN_HEIGHT - 70))
 
 
     # プレイヤー
@@ -908,6 +962,69 @@ def draw_game(screen):
     screen.blit(portal_img, (int(portal_draw_x - PORTAL_W // 2), int(portal_draw_y - PORTAL_H // 2)))
 
 # ===============================
+# 敵のアルゴリズム
+# ===============================
+# --- スリープ挙動パラメータ ---
+BLOCK_SAFE_DIST         = 2000   # ブロックまでの最短距離がこれ以下なら“眠らない”
+BLOCK_WAKE_DIST_HYST    = 1900   # 起床のブロック距離（ヒステリシス）
+MIN_DIST_FROM_BLOCKS = 1000  # ブロックからの最小距離（px）
+R_MIN                   = 1500   # 敵の保険スポーン距離（px）
+
+def enemy_center(enemy):
+    cx = enemy['x'] + enemy['rect'].w * 0.5
+    cy = enemy['y'] + enemy['rect'].h * 0.5
+    return cx, cy
+
+def dist_blocks_min(cx, cy):
+    """敵中心→最も近いブロック距離"""
+    return min_distance_to_blocks(cx, cy, border_blocks)
+
+def in_same_player_tile(cx, cy):
+    """敵中心がプレイヤーと同じ“論理タイル”にいるか？"""
+    pgx, pgy = spawn_rel_tile(player_x, player_y)
+    egx, egy = spawn_rel_tile(cx, cy)
+    return (pgx == egx) and (pgy == egy)
+
+def enemy_should_sleep(cx, cy):
+    """眠る条件：
+       - プレイヤーと同一タイルなら眠らない
+       - ブロックまでの最短距離が BLOCK_SAFE_DIST 以下なら眠らない
+       - それ以外なら眠る
+    """
+    if in_same_player_tile(cx, cy):
+        return False
+    if dist_blocks_min(cx, cy) <= BLOCK_SAFE_DIST:
+        return False
+    return True  # どちらにも当てはまらない → 眠る
+
+def enemy_should_wake(cx, cy):
+    """起床条件：
+       - プレイヤーと同じタイルに入った
+       - またはブロックに近づいた（距離 < BLOCK_WAKE_DIST_HYST）
+    """
+    if in_same_player_tile(cx, cy):
+        return True
+    if dist_blocks_min(cx, cy) < BLOCK_WAKE_DIST_HYST:
+        return True
+    return False
+
+def sleep_enemy(enemy):
+    enemy['sleep'] = True
+    enemy['ai_disabled'] = True
+
+def wake_enemy(enemy):
+    enemy['sleep'] = False
+    enemy['ai_disabled'] = False
+
+# ===============================
+# 建築物のアルゴリズム
+# ===============================
+# --- portals（将来複数OK） ---
+PORTALS = []  # 各要素: {"rect": pygame.Rect(...)}
+def list_portals():
+    return PORTALS
+
+# ===============================
 # ゲームリセット
 # ===============================
 def reset_game():
@@ -920,7 +1037,7 @@ def reset_game():
     global shortwaves, Weapon_shortwave_image, shortwave_base_w, shortwave_base_h, initial_scale, shortwave_level, weapon_shortwave_cooldown, weapon_shortwave_duration, weapon_shortwave_timer
     global game_speed, game_time, goel_time, game_clear
     global LEVELUP_PICK_COUNT
-    global border_blocks
+    global border_blocks, PORTALS
 
     start_ticks = pygame.time.get_ticks()  # ← ゲーム開始時刻（ミリ秒）
 
@@ -928,6 +1045,15 @@ def reset_game():
     SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
 
     border_blocks = build_spawn_border(SPAWN_CENTER_WX, SPAWN_CENTER_WY, half=500) #halfで囲いの大きさを設定
+
+    # ★ここでPORTALSを更新（いまは1個）
+    PORTALS = [{
+        "rect": pygame.Rect(
+            SPAWN_CENTER_WX - PORTAL_W // 2,
+            SPAWN_CENTER_WY - PORTAL_H // 2,
+            PORTAL_W, PORTAL_H
+        )
+    }]
 
     LABEL_FONT = jp_font(14)   # ← ここで再初期化
     LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
@@ -1025,7 +1151,10 @@ def resolve_enemy_collisions(enemies):
     for _ in range(ENEMY_SEP_ITER):
         grid = {}
         # バケットに振り分け
+        # バケットに振り分け
         for idx, e in enumerate(enemies):
+            if e.get('sleep'):    # ★眠りは空間ハッシュに入れない
+                continue
             cx = int(e['x'] // cell)
             cy = int(e['y'] // cell)
             grid.setdefault((cx, cy), []).append(idx)
@@ -1047,9 +1176,11 @@ def resolve_enemy_collisions(enemies):
                             if key in checked:
                                 continue
                             checked.add(key)
-
+                            
                             a = enemies[i]
                             b = enemies[j]
+                            if a.get('sleep') or b.get('sleep'):  # ★眠りは動かさない
+                                continue
                             dx = b['x'] - a['x']
                             dy = b['y'] - a['y']
                             dist2 = dx*dx + dy*dy
@@ -1082,33 +1213,168 @@ def resolve_enemy_collisions(enemies):
                                 b['rect'].topleft = (int(b['x']), int(b['y']))
 
 # 敵を出現させる
+def point_rect_distance(px, py, r: pygame.Rect):
+    """点(px,py)と矩形rのユークリッド距離（0なら接触/内部）"""
+    # 矩形外なら外側の最近点まで、内部なら0
+    dx = 0.0
+    if px < r.left:
+        dx = r.left - px
+    elif px > r.right:
+        dx = px - r.right
+
+    dy = 0.0
+    if py < r.top:
+        dy = r.top - py
+    elif py > r.bottom:
+        dy = py - r.bottom
+
+    if dx == 0.0 and dy == 0.0:
+        return 0.0
+    return (dx*dx + dy*dy) ** 0.5
+
+def min_distance_to_blocks(px, py, blocks):
+    """点と複数ブロックとの最小距離"""
+    if not blocks:
+        return float('inf')
+    dmin = float('inf')
+    for b in blocks:
+        # bがRectそのものか、オブジェクトにrectを持つかの両対応
+        r = b if isinstance(b, pygame.Rect) else b.get('rect', None)
+        if r is None:
+            continue
+        d = point_rect_distance(px, py, r)
+        if d < dmin:
+            dmin = d
+    return dmin
+
+# 敵のスポーン位置
+def segment_intersects_rect(x1, y1, x2, y2, r: pygame.Rect) -> bool:
+    """線分(x1,y1)-(x2,y2)が矩形rと交差するか（境界含む）"""
+    # 1) 端点どちらかが矩形内なら「交差」とみなす
+    if r.collidepoint(x1, y1) or r.collidepoint(x2, y2):
+        return True
+
+    # 2) 矩形の4辺と線分の交差をチェック
+    x3, y3, x4, y4 = r.left, r.top, r.right, r.top       # 上辺
+    if _seg_seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4): return True
+    x3, y3, x4, y4 = r.right, r.top, r.right, r.bottom   # 右辺
+    if _seg_seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4): return True
+    x3, y3, x4, y4 = r.left, r.bottom, r.right, r.bottom # 下辺
+    if _seg_seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4): return True
+    x3, y3, x4, y4 = r.left, r.top, r.left, r.bottom     # 左辺
+    if _seg_seg_intersect(x1, y1, x2, y2, x3, y3, x4, y4): return True
+
+    return False
+
+def _seg_seg_intersect(x1,y1,x2,y2, x3,y3,x4,y4) -> bool:
+    """2線分が交差しているか（共線の重なりや端点接触もTrue）"""
+    def ccw(ax,ay, bx,by, cx,cy):
+        return (bx-ax)*(cy-ay) - (by-ay)*(cx-ax)
+    d1 = ccw(x1,y1,x2,y2,x3,y3)
+    d2 = ccw(x1,y1,x2,y2,x4,y4)
+    d3 = ccw(x3,y3,x4,y4,x1,y1)
+    d4 = ccw(x3,y3,x4,y4,x2,y2)
+    # 一般の交差
+    if (d1*d2 < 0) and (d3*d4 < 0):
+        return True
+    # 共線＆重なり（境界含む）
+    def between(a,b,c):  # c が [min(a,b), max(a,b)] にいる？
+        return min(a,b) <= c <= max(a,b)
+    if d1 == 0 and between(x1,x2,x3) and between(y1,y2,y3): return True
+    if d2 == 0 and between(x1,x2,x4) and between(y1,y2,y4): return True
+    if d3 == 0 and between(x3,x4,x1) and between(y3,y4,y1): return True
+    if d4 == 0 and between(x3,x4,x2) and between(y3,y4,y2): return True
+    return False
+
+def crosses_wall_to_portal(cx, cy, portals, blocks, crossings_required=1) -> bool:
+    """
+    候補点(cx,cy)→各ポータル中心への線分が、ブロック矩形と少なくとも
+    crossings_required 回交差するか？（どれか1つのポータルに対して満たせばOK）
+    """
+    for p in portals:
+        pr = p["rect"]
+        px, py = pr.center
+        hits = 0
+        for b in blocks:
+            br = b["rect"] if isinstance(b, dict) else (b if isinstance(b, pygame.Rect) else None)
+            if br is None: 
+                continue
+            if segment_intersects_rect(cx, cy, px, py, br):
+                hits += 1
+                if hits >= crossings_required:
+                    return True
+    return False
+
 def spawn_enemy():
     if len(enemies) >= MAX_ENEMIES:
         return
-    side = random.randint(0, 3)
-    if side == 0:
-        x = random.randint(0, SCREEN_WIDTH - enemy_image.get_width()) + player_x - SCREEN_WIDTH // 2
-        y = player_y - SCREEN_HEIGHT // 2 - enemy_image.get_height()
-    elif side == 1:
-        x = random.randint(0, SCREEN_WIDTH - enemy_image.get_width()) + player_x - SCREEN_WIDTH // 2
-        y = player_y + SCREEN_HEIGHT // 2
-    elif side == 2:
-        x = player_x - SCREEN_WIDTH // 2 - enemy_image.get_width()
-        y = random.randint(0, SCREEN_HEIGHT - enemy_image.get_height()) + player_y - SCREEN_HEIGHT // 2
-    else:
-        x = player_x + SCREEN_WIDTH // 2
-        y = random.randint(0, SCREEN_HEIGHT - enemy_image.get_height()) + player_y - SCREEN_HEIGHT // 2
-    enemies.append({
-        'rect': pygame.Rect(x, y, enemy_image.get_width(), enemy_image.get_height()),
-        'x': x, 'y': y,
-        'hp': enemy_base_hp,
-        'max_hp': enemy_base_hp,
-        'atk': enemy_base_attack,
-        'level': enemy_level, 
-        'last_hits': {},
-        'alpha': 255,       # フェードアウト用の透明度
-        'dying': False      # フェードアウト中かどうか
-    })
+
+    w, h = enemy_image.get_width(), enemy_image.get_height()
+
+    # ① プレイヤーがいる“論理タイル”の中心→そのタイルの左上/右下（ワールド座標）を計算
+    pgx, pgy = spawn_rel_tile(player_x, player_y)   # プレイヤーがいるタイル(±5000/10000ルール)
+    tile_cx, tile_cy = center_of_tile(pgx, pgy, TILE_W, TILE_H)
+    tile_left   = tile_cx - TILE_W // 2
+    tile_right  = tile_cx + TILE_W // 2
+    tile_top    = tile_cy - TILE_H // 2
+    tile_bottom = tile_cy + TILE_H // 2
+
+    # ② タイル内でランダムサンプリング（中心=候補点）→ブロックから1000以上＆非衝突なら採用
+    # === 敵を出現させる ===
+    MAX_TRIES = 300
+    portals = list_portals()  # ★ 現在登録されているポータル（1個または複数）
+    PORTAL_SAFE_RADIUS = max(PORTAL_W, PORTAL_H) // 2 + 100  # ポータル保護距離(px)
+
+    for _ in range(MAX_TRIES):
+        # タイル内のランダム座標
+        cx = random.uniform(tile_left + w * 0.5, tile_right - w * 0.5)
+        cy = random.uniform(tile_top + h * 0.5, tile_bottom - h * 0.5)
+
+        # 敵の矩形
+        x = int(cx - w * 0.5)
+        y = int(cy - h * 0.5)
+        rect = pygame.Rect(x, y, w, h)
+    
+        # --- 条件チェック ---
+
+        # ① ブロックと重ならない
+        if rect_collides_any(rect, border_blocks):
+            continue
+
+        # ② ブロックから1000px以上離す（中心で判定）
+        if min_distance_to_blocks(cx, cy, border_blocks) < MIN_DIST_FROM_BLOCKS:
+            continue
+
+        # ③ ポータルに近すぎない（保護距離）
+        too_close_to_portal = False
+        for p in portals:
+            px, py = p["rect"].center
+            if math.hypot(cx - px, cy - py) < PORTAL_SAFE_RADIUS:
+                too_close_to_portal = True
+                break
+        if too_close_to_portal:
+            continue
+
+        # ④ 壁の“外側”のみ許可（ポータル中心へ線を引いたとき壁を最低1回跨ぐ）
+        if not crosses_wall_to_portal(cx, cy, portals, border_blocks, crossings_required=1):
+            continue
+
+        # --- ここまで通れば採用 ---
+        enemies.append({
+            'rect': rect,
+            'x': x, 'y': y,
+            'hp': enemy_base_hp, 'max_hp': enemy_base_hp,
+            'atk': enemy_base_attack,
+            'level': enemy_level,
+            'last_hits': {},
+            'alpha': 255,
+            'dying': False,
+        })
+        return  # 1体湧かせたら終了
+
+    # 200回試しても見つからなければ、今回は湧かせない
+    return
+
 
 ENEMY_FADE_LEVELS = [255, 200, 150, 100, 50, 0]
 enemy_fade_images = {}
@@ -2371,6 +2637,27 @@ while running:
 
         # 敵の移動と衝突判定（ブロックにも当たる）
         for enemy in enemies:
+            # --- スリープ／ウェイク判定（最初にやる） ---
+            cx_enemy, cy_enemy = enemy_center(enemy)
+
+            if enemy.get('sleep'):
+                # 眠っている → 起床条件を満たすまで完全スキップ（座標維持）
+                if not enemy_should_wake(cx_enemy, cy_enemy):
+                    # 位置・描画・HPバーは draw 側でそのまま出る（座標は固定）
+                    enemy['prev_cx'] = enemy['rect'].centerx
+                    enemy['prev_cy'] = enemy['rect'].centery
+                    continue
+                else:
+                    # 起こす
+                    wake_enemy(enemy)
+            else:
+                # 起きている → 眠る条件ならこのフレームは何もせず眠る
+                if enemy_should_sleep(cx_enemy, cy_enemy):
+                    sleep_enemy(enemy)
+                    enemy['prev_cx'] = enemy['rect'].centerx
+                    enemy['prev_cy'] = enemy['rect'].centery
+                    continue
+
             # 直前中心位置（レーザー掃引やノックバック等で使う）
             enemy['prev_cx'] = enemy['rect'].centerx
             enemy['prev_cy'] = enemy['rect'].centery
