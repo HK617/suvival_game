@@ -281,13 +281,12 @@ def load_game_data():
                             gx, gy = pair
                             EXPLORED_TILES.add((int(gx), int(gy)))
 
-                # ★ 新規: ブロック配置（短縮・互換）
-                blocks_compact = data.get("blocks_compact")
-                blocks_data    = data.get("blocks")
-
-                SAVED_BLOCKS_LAYOUT = None
-                if isinstance(blocks_compact, str) and blocks_compact:
-                    SAVED_BLOCKS_LAYOUT = decode_blocks(blocks_compact)
+                # ★ ブロック配置（タイル分割・改行行）
+                blocks_compact_tiled = data.get("blocks_compact_tiled")
+                global TILED_BLOCKS
+                TILED_BLOCKS = {}
+                if isinstance(blocks_compact_tiled, str) and blocks_compact_tiled:
+                    TILED_BLOCKS = decode_blocks_tiled(blocks_compact_tiled)
 
                 print("セーブデータを読み込みました。")
 
@@ -320,11 +319,11 @@ def save_game_data():
     # 探索済みを "gx,gy;..." へ
     explored_str = ";".join(f"{gx},{gy}" for gx, gy in EXPLORED_TILES)
 
-    # ★ ブロック保存（超短縮）
+    # ★ ブロック保存：タイルごと1行の文字列に
     try:
-        blocks_compact = encode_blocks(border_blocks)
+        blocks_compact_tiled = encode_blocks_tiled(TILED_BLOCKS)
     except Exception:
-        blocks_compact = ""
+        blocks_compact_tiled = ""
 
     data = {
         "persistent_attack_bonus": persistent_attack_bonus,
@@ -334,9 +333,8 @@ def save_game_data():
         "battery":                 battery,
         "bg_seed":                 BG_RANDOM_SEED,
         "explored_tiles":          explored_str,
-        "blocks_compact":          blocks_compact,
+        "blocks_compact_tiled":    blocks_compact_tiled,
     }
-
     with open(SAVE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
         print("セーブデータを保存しました。")
@@ -665,6 +663,20 @@ minimap_cam_y = 0.0         # ミニマップ内カメラのYオフセット（p
 
 
 #=============建築物の描画====================
+# プレイヤー周辺の3×3のタイル座標を会得
+def tile_neighbors_3x3(gx, gy):
+    return [(gx+dx, gy+dy) for dy in (-1,0,1) for dx in (-1,0,1)]
+
+def rebuild_border_blocks_around(gx, gy):
+    """プレイヤー近傍3×3タイルだけを border_blocks に“参照”として集約する"""
+    global border_blocks
+    blocks = []
+    for key in tile_neighbors_3x3(gx, gy):
+        lst = TILED_BLOCKS.get(key)
+        if lst:
+            blocks.extend(lst)  # ←オブジェクト参照を共有（コピーしない）
+    border_blocks = blocks
+
 def build_spawn_border(cx, cy, half=300, block_hp=100):
     rects = []
     s = BLOCK_SIZE
@@ -749,75 +761,77 @@ def make_block_from_xy(x, y, img="block1.png", hp=100, collidable=True, door_sta
     return b
 
 
-def encode_blocks(blocks):
+def encode_blocks_tiled(tiles_dict: dict) -> str:
     """
-    ブロック群を超短い文字列に圧縮:
-      1エントリ = "x,y,t[,hp]"
-      ・t は 0=壁, 1=閉ドア, 2=開ドア
-      ・hp は“既定値”なら省略（壁=100, 閉ドア=DOOR_MAX_HP, 開ドア=0）
-      ・エントリ区切りは ';'
+    保存形式（タイルごとに改行）:
+      Gx,Gy>x,y,t[,hp];x,y,t ...
+    を 1 行 = 1 タイル として連結し、行区切りは '\n'
+    ・t: 0=壁, 1=閉ドア, 2=開ドア
+    ・hp は既定値なら省略（壁=100, 閉ドア=DOOR_MAX_HP, 開ドア=0）
     """
-    parts = []
-    for br in blocks:
-        r = br["rect"]
-        x, y = r.x, r.y
-        img = br.get("img", "block1.png")
-        t = IMG_CODE.get(img, "0")
-
-        hp = int(br.get("hp", 100))
-        default_hp = 100 if t == "0" else (DOOR_MAX_HP if t == "1" else 0)
-
-        if hp == default_hp:
-            parts.append(f"{x},{y},{t}")
-        else:
-            parts.append(f"{x},{y},{t},{hp}")
-    return ";".join(parts)
+    lines = []
+    for (gx, gy), lst in tiles_dict.items():
+        entries = []
+        for br in lst:
+            r = br["rect"]; x, y = r.x, r.y
+            t = IMG_CODE.get(br.get("img", "block1.png"), "0")
+            hp = int(br.get("hp", 100))
+            default_hp = 100 if t == "0" else (DOOR_MAX_HP if t == "1" else 0)
+            entries.append(f"{x},{y},{t}" if hp == default_hp else f"{x},{y},{t},{hp}")
+        if entries:
+            lines.append(f"{gx},{gy}>{';'.join(entries)}")
+    return "\n".join(lines)
 
 
-def decode_blocks(compact: str):
+def decode_blocks_tiled(compact_tiled: str) -> dict:
     """
-    encode_blocks で作った文字列をブロック配列に戻す。
-    collidable/door_state は img & hp から自動導出。
+    改行区切りで 1 行=1タイル の保存文字列を辞書 {(gx,gy): [blocks...]} に復元。
     """
-    if not compact:
-        return []
+    tiles: dict[tuple[int,int], list] = {}
+    if not compact_tiled:
+        return tiles
 
-    out = []
-    for entry in compact.split(";"):
-        entry = entry.strip()
-        if not entry:
+    for line in compact_tiled.splitlines():
+        line = line.strip()
+        if not line or ">" not in line:
             continue
-        fields = entry.split(",")
-        # x,y,t[,hp]
-        if len(fields) < 3:
+        head, body = line.split(">", 1)
+        try:
+            gx_str, gy_str = head.split(",", 1)
+            gx, gy = int(gx_str), int(gy_str)
+        except Exception:
             continue
-        x = int(fields[0]); y = int(fields[1]); t = fields[2]
-        img = CODE_IMG.get(t, "block1.png")
 
-        # 既定HP
-        default_hp = 100 if t == "0" else (DOOR_MAX_HP if t == "1" else 0)
-        hp = int(fields[3]) if len(fields) >= 4 else default_hp
+        lst = tiles.setdefault((gx, gy), [])
+        for entry in body.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            f = entry.split(",")
+            if len(f) < 3:
+                continue
+            x, y, t = int(f[0]), int(f[1]), f[2]
+            img = CODE_IMG.get(t, "block1.png")
+            default_hp = 100 if t == "0" else (DOOR_MAX_HP if t == "1" else 0)
+            hp = int(f[3]) if len(f) >= 4 else default_hp
 
-        # 派生プロパティ
-        if t == "1" and hp > 0:
-            door_state = "closed"
-            collidable = True
-        elif t == "2":
-            door_state = "open"
-            collidable = False
-        else:
-            door_state = None
-            collidable = (hp > 0)
+            if t == "1" and hp > 0:
+                door_state, collidable, max_hp = "closed", True, DOOR_MAX_HP
+            elif t == "2":
+                door_state, collidable, max_hp = "open", False, 0
+            else:
+                door_state, collidable, max_hp = None, (hp > 0), hp
 
-        out.append({
-            "rect": pygame.Rect(int(x), int(y), BLOCK_SIZE, BLOCK_SIZE),
-            "img": img,
-            "collidable": collidable,
-            "door_state": door_state,
-            "hp": hp,
-            "max_hp": hp if door_state is None else (DOOR_MAX_HP if door_state == "closed" else 0),
-        })
-    return out
+            lst.append({
+                "rect": pygame.Rect(int(x), int(y), BLOCK_SIZE, BLOCK_SIZE),
+                "img": img,
+                "collidable": collidable,
+                "door_state": door_state,
+                "hp": hp,
+                "max_hp": max_hp,
+            })
+
+    return tiles
 
 
 def default_border_blocks_with_door(cx, cy, half=500, hp=100):
@@ -1091,7 +1105,7 @@ def draw_game(screen):
     screen.blit(enemy_level_text, (10, 170))
     screen.blit(coord_text, text_rect)
 
-        # === タイル座標の表示（新規） ===
+    # === タイル座標の表示（新規） ===
     gx, gy = spawn_rel_tile(player_x, player_y)
     tile_text = font.render(f"Tile: ({gx}, {gy})", True, (50, 50, 50))
     tile_text_rect = tile_text.get_rect()
@@ -1174,7 +1188,7 @@ def list_portals():
 # ===============================
 def reset_game():
     global BG_RANDOM_SEED
-    global player_x, player_y, SPAWN_CENTER_WX, SPAWN_CENTER_WY, player_hp, player_max_hp, base_attack, exp, level, exp_to_next, exp_rato, player_speed, player_defence, player_clitical_rato, player_clitical_damage, PLAYER_IFRAME_MAX, player_iframe, player_vx, player_vy
+    global player_x, player_y, pgx, pgy, SPAWN_CENTER_WX, SPAWN_CENTER_WY, player_hp, player_max_hp, base_attack, exp, level, exp_to_next, exp_rato, player_speed, player_defence, player_clitical_rato, player_clitical_damage, PLAYER_IFRAME_MAX, player_iframe, player_vx, player_vy
     global weapons, weapon_counter, lasers, laser_level, laser_timer, laser_cooldown, laser_duration, enemy_spawn_timer, score, start_ticks
     global enemies, enemy_base_hp, enemy_base_attack, enemy_speed, enemy_level, last_buff_time, ENEMY_RADIUS, ENEMY_SEP_ITER, LABEL_FONT, LABEL_GRID_CACHE
     global damage_texts
@@ -1182,35 +1196,14 @@ def reset_game():
     global shortwaves, Weapon_shortwave_image, shortwave_base_w, shortwave_base_h, initial_scale, shortwave_level, weapon_shortwave_cooldown, weapon_shortwave_duration, weapon_shortwave_timer
     global game_speed, game_time, goel_time, game_clear
     global LEVELUP_PICK_COUNT
-    global border_blocks, PORTALS
+    global border_blocks, PORTALS, TILED_BLOCKS, CURRENT_PLAYER_TILE
 
     start_ticks = pygame.time.get_ticks()  # ← ゲーム開始時刻（ミリ秒）
 
+    pgx, pgy = 0, 0  # 初期タイル（スポーン点）
+
     player_x, player_y = center_of_tile(0, 0, TILE_W, TILE_H)
     SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
-
-    # ★ ブロック配置：savedataにあればそれを使い、無ければ既定形＋ドアを作る
-    if 'SAVED_BLOCKS_LAYOUT' in globals() and SAVED_BLOCKS_LAYOUT:
-        border_blocks = SAVED_BLOCKS_LAYOUT
-    else:
-        border_blocks = default_border_blocks_with_door(SPAWN_CENTER_WX, SPAWN_CENTER_WY, half=500, hp=100)
-        # 初回に既定配置を保存しておく（以後はロードで再現される）
-        try:
-            save_game_data()
-        except Exception:
-            pass
-
-    # ★ここでPORTALSを更新（いまは1個）
-    PORTALS = [{
-        "rect": pygame.Rect(
-            SPAWN_CENTER_WX - PORTAL_W // 2,
-            SPAWN_CENTER_WY - PORTAL_H // 2,
-            PORTAL_W, PORTAL_H
-        )
-    }]
-
-    LABEL_FONT = jp_font(14)   # ← ここで再初期化
-    LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
 
     #ゲームスピード
     game_speed = 1.0
@@ -1291,6 +1284,32 @@ def reset_game():
         Weapon_shortwave_base,
         (int(shortwave_base_w * initial_scale), int(shortwave_base_h * initial_scale))
     )
+
+    # ★ ブロック配置：savedataにあればそれを使い、無ければ既定形＋ドアを作る
+    if TILED_BLOCKS:
+        pass  # load_game_data() で復元済み
+    else:
+        raw = default_border_blocks_with_door(SPAWN_CENTER_WX, SPAWN_CENTER_WY, half=500, hp=100)
+        TILED_BLOCKS = {(pgx, pgy): raw}
+        try:
+            save_game_data()
+        except Exception:
+            pass
+
+    CURRENT_PLAYER_TILE = (pgx, pgy)
+    rebuild_border_blocks_around(pgx, pgy)
+
+    # ★ここでPORTALSを更新（いまは1個）
+    PORTALS = [{
+        "rect": pygame.Rect(
+            SPAWN_CENTER_WX - PORTAL_W // 2,
+            SPAWN_CENTER_WY - PORTAL_H // 2,
+            PORTAL_W, PORTAL_H
+        )
+    }]
+
+    LABEL_FONT = jp_font(14)   # ← ここで再初期化
+    LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
 
 #敵同士の当たり判定
 def resolve_enemy_collisions(enemies):
@@ -2733,6 +2752,12 @@ while running:
 
         # 確定
         player_x, player_y = nx, ny
+
+        # ★ タイル遷移チェック：変わったらロード範囲（3×3）を入れ替え
+        new_tile = spawn_rel_tile(player_x, player_y)
+        if new_tile != CURRENT_PLAYER_TILE:
+            CURRENT_PLAYER_TILE = new_tile
+            rebuild_border_blocks_around(*new_tile)
         
         # 最終的なプレイヤー判定Rect（他の衝突にもこれを使う）
         player_rect = pygame.Rect(
@@ -2917,6 +2942,13 @@ while running:
                         try:
                             border_blocks.remove(hit_block_br)
                         except ValueError:
+                            pass
+                            # ★ タイル辞書からも消す（同じオブジェクト参照を削除）
+                        try:
+                            gk = spawn_rel_tile(hit_block_br["rect"].x, hit_block_br["rect"].y)  # ← (gx,gy) を返す関数
+                            if gk in TILED_BLOCKS and hit_block_br in TILED_BLOCKS[gk]:
+                                TILED_BLOCKS[gk].remove(hit_block_br)
+                        except Exception:
                             pass
                         
         # 全員動かし終わってから1回だけ、重なり解消
