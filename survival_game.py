@@ -964,6 +964,12 @@ def draw_game(screen):
             bar_y = screen_rect.y - (bar_h + 2)
             draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h, br.get("hp", 0), br.get("max_hp", 0), fill=(200,80,80))
 
+    # --- ポータル ---
+    portal_draw_x = SPAWN_CENTER_WX - player_x + PLAYER_DRAW_X
+    portal_draw_y = SPAWN_CENTER_WY - player_y + PLAYER_DRAW_Y
+    screen.blit(portal_img, (int(portal_draw_x - PORTAL_W // 2), int(portal_draw_y - PORTAL_H // 2)))
+
+
 
     # （デバッグ）当たり判定の枠を表示したいとき
     # pygame.draw.rect(screen, (255, 0, 0), screen_rect, 1)
@@ -1194,11 +1200,6 @@ def draw_game(screen):
     # ★ 探索済みタイルに追加（重複は set なので気にしない）
     EXPLORED_TILES.add((gx, gy))
 
-    # === 初期スポーン地点(タイル0,0の中心=SPAWN_CENTER_WX/WY)にポータルを描く ===
-    portal_draw_x = SPAWN_CENTER_WX - player_x + PLAYER_DRAW_X
-    portal_draw_y = SPAWN_CENTER_WY - player_y + PLAYER_DRAW_Y
-    screen.blit(portal_img, (int(portal_draw_x - PORTAL_W // 2), int(portal_draw_y - PORTAL_H // 2)))
-
 # ===============================
 # 敵のアルゴリズム
 # ===============================
@@ -1424,14 +1425,28 @@ def reset_game():
     CURRENT_PLAYER_TILE = (pgx, pgy)
     rebuild_border_blocks_around(pgx, pgy)
 
-    # ★ここでPORTALSを更新（いまは1個）
+    # ★ PORTALS（当たり判定は portal.png には付けず、透明の四角形だけ）
+    portal_center_x = SPAWN_CENTER_WX
+    portal_center_y = SPAWN_CENTER_WY
+
+    pw, ph = PORTAL_W, PORTAL_H
+
+    # “上寄りで長め”の当たり判定
+    #   幅：portal と同じ
+    #   高さ：portal の 70%（お好みで 0.6～0.8 に）
+    #   位置：top は 画像の最上端（center_y - ph/2）に固定（=上に寄せる）
+    hit_h = int(ph * 0.80)
+    collision_rect = pygame.Rect(
+        int(portal_center_x - pw / 2),   # 左上 x
+        int(portal_center_y - ph / 2),   # 左上 y（= 画像のトップ）
+        int(pw),                         # 幅
+        hit_h                            # 高さ（上寄りの長め当たり判定）
+    )
+
     PORTALS = [{
-        "rect": pygame.Rect(
-            SPAWN_CENTER_WX - PORTAL_W // 2,
-            SPAWN_CENTER_WY - PORTAL_H // 2,
-            PORTAL_W, PORTAL_H
-        )
+        "rect": collision_rect
     }]
+
 
     LABEL_FONT = jp_font(14)   # ← ここで再初期化
     LABEL_GRID_CACHE = {}      # ← キャッシュは空でOK
@@ -2848,28 +2863,8 @@ while running:
         if pr.width > 0:
             pcx, pcy = pr.center  # ★ ポータル中心座標を取得
             # 中心から誤差±20以内（長方形判定でもOK・必要なら円距離に変えても可）
-            if abs(player_x - pcx) <= 20 and abs(player_y - pcy) <= 20:
+            if abs(player_x - pcx) <= 60 and abs(player_y - pcy - 80) <= 20: #ポータル判定の誤差
                 show_return_prompt = True
-        
-        # ★ プレイヤーの“見た目位置”の下にテキストを出す（in_base と同じ感じ）
-        if show_return_prompt:
-            tip_font = jp_font(28)
-            tip = tip_font.render("baseに戻りますか？（Fキー）", True, (0, 0, 0))
-            # 画面中央にプレイヤーを描いているので、そこを基準に下側へ
-            tip_x = SCREEN_WIDTH // 2 - tip.get_width() // 2
-            # プレイヤー画像の下に少し余白を足して配置（お好みで調整）
-            tip_y = SCREEN_HEIGHT // 2 + player_original.get_height() // 2 + 40
-            screen.blit(tip, (tip_x, tip_y))
-
-            # Fキーで base に戻る
-            if pygame.key.get_pressed()[pygame.K_f]:
-                # 必要ならセーブ（お好み）
-                try:
-                    save_game_data()
-                except Exception:
-                    pass
-                enter_base_from_game()
-                # ここでこのフレームの描画を終わらせて戻ってOK
     
 
         # 移動
@@ -3354,8 +3349,44 @@ while running:
             if dt["timer"] <= 0:
                 damage_texts.remove(dt)
         
-        #darw_game関数を呼び出す
+        #========================
+        #ゲームの描画
+        #=======================
         draw_game(screen)
+        
+        #============================
+        #描画のあとに判定するイベント
+        #============================
+        # ★ プレイヤーの“見た目位置”の下にテキストを出す（in_base と同じ感じ）
+        if show_return_prompt:
+            tip_font = jp_font(28)
+            tip = tip_font.render("baseに戻りますか？（Fキー）", True, (0, 0, 0))
+            # 画面中央にプレイヤーを描いているので、そこを基準に下側へ
+            tip_x = SCREEN_WIDTH // 2 - tip.get_width() // 2
+            # プレイヤー画像の下に少し余白を足して配置（お好みで調整）
+            tip_y = SCREEN_HEIGHT // 2 + player_original.get_height() // 2 + 40
+            screen.blit(tip, (tip_x, tip_y))
+
+            # Fキーで base に戻る
+            if pygame.key.get_pressed()[pygame.K_f]:
+                # 必要ならセーブ（お好み）
+                try:
+                    save_game_data()
+                except Exception:
+                    pass
+                base_world_x = 0
+                base_world_y = 0
+                enter_base_from_game()
+                # ここでこのフレームの描画を終わらせて戻ってOK
+        
+        # --- Game Over判定 ---
+        if player_hp <= 0:
+            game_over = True
+            restore_savedata_from_snapshot()  #ゲームを始める前の状態に戻す
+            # このフレームはここまでにして、次ループで game_over=True の分岐へ移る
+            continue
+
+
         pygame.display.flip()
         clock.tick(60)
 
