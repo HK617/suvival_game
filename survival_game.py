@@ -247,8 +247,10 @@ def load_game_data():
     global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
     global BG_RANDOM_SEED, EXPLORED_TILES
     global SAVED_BLOCKS_LAYOUT   # ★ 追加
+    global SAVED_PORTAL   # ★ 追加（読込先）
 
     SAVED_BLOCKS_LAYOUT = None   # デフォルト
+    SAVED_PORTAL = None   # ★ 追加：デフォルト
 
     pad, psp, pmh, pexp, bat = 1, 5, 10, 1, 0
     seed_default = BG_RANDOM_SEED
@@ -288,6 +290,16 @@ def load_game_data():
                 if isinstance(blocks_compact_tiled, str) and blocks_compact_tiled:
                     TILED_BLOCKS = decode_blocks_tiled(blocks_compact_tiled)
 
+                # ★ 追加：ポータル座標を読み込む
+                portal_data = data.get("portal")
+                if isinstance(portal_data, dict):
+                    try:
+                        px = int(portal_data.get("x", 0))
+                        py = int(portal_data.get("y", 0))
+                        SAVED_PORTAL = {"x": px, "y": py}
+                    except Exception:
+                        SAVED_PORTAL = None
+
                 print("セーブデータを読み込みました。")
 
             except json.JSONDecodeError:
@@ -317,9 +329,20 @@ def load_game_data():
 # ===============================
 def save_game_data():
     # 探索済みを "gx,gy;..." へ
-    explored_str = ";".join(f"{gx},{gy}" for gx, gy in EXPLORED_TILES)
+    try:
+        explored_str = ";".join(
+            f"{gx},{gy}"
+            for (gx, gy), v in (EXPLORED_TILES or {}).items()
+            if v
+        )
+    except Exception:
+        explored_str = ""
 
-    # ★ ブロック保存：タイルごと1行の文字列に
+    # ポータル（見た目中心で保存）
+    vx, vy = get_portal_visual_center()
+    portal_save = {"x": int(vx), "y": int(vy)}
+
+    # ブロック保存：タイルごと1行の文字列に
     try:
         blocks_compact_tiled = encode_blocks_tiled(TILED_BLOCKS)
     except Exception:
@@ -334,6 +357,7 @@ def save_game_data():
         "bg_seed":                 BG_RANDOM_SEED,
         "explored_tiles":          explored_str,
         "blocks_compact_tiled":    blocks_compact_tiled,
+        "portal":                  portal_save,
     }
     with open(SAVE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
@@ -965,11 +989,11 @@ def draw_game(screen):
             draw_hp_bar(screen, bar_x, bar_y, bar_w, bar_h, br.get("hp", 0), br.get("max_hp", 0), fill=(200,80,80))
 
     # --- ポータル ---
-    portal_draw_x = SPAWN_CENTER_WX - player_x + PLAYER_DRAW_X
-    portal_draw_y = SPAWN_CENTER_WY - player_y + PLAYER_DRAW_Y
-    screen.blit(portal_img, (int(portal_draw_x - PORTAL_W // 2), int(portal_draw_y - PORTAL_H // 2)))
-
-
+    vx, vy = get_portal_visual_center()
+    portal_draw_x = vx - player_x + PLAYER_DRAW_X
+    portal_draw_y = vy - player_y + PLAYER_DRAW_Y
+    screen.blit(portal_img, (int(portal_draw_x - PORTAL_W // 2),
+                         int(portal_draw_y - PORTAL_H // 2)))
 
     # （デバッグ）当たり判定の枠を表示したいとき
     # pygame.draw.rect(screen, (255, 0, 0), screen_rect, 1)
@@ -1270,6 +1294,15 @@ def get_main_portal_rect() -> pygame.Rect:
         return PORTALS[0].get("rect", pygame.Rect(0,0,0,0))
     return pygame.Rect(0,0,0,0)
 
+def get_portal_visual_center():
+    """当たり判定Rectから『画像の中心』(見た目の中心)を復元して返す"""
+    pr = get_main_portal_rect()
+    if pr.width <= 0:
+        return SPAWN_CENTER_WX, SPAWN_CENTER_WY
+    cx = pr.left + PORTAL_W // 2
+    cy = pr.top  + PORTAL_H // 2
+    return cx, cy
+
 # ドアの開閉
 def update_doors_by_distance(px: float, py: float, open_dist: float = 50.0):
     """
@@ -1425,22 +1458,26 @@ def reset_game():
     CURRENT_PLAYER_TILE = (pgx, pgy)
     rebuild_border_blocks_around(pgx, pgy)
 
-    # ★ PORTALS（当たり判定は portal.png には付けず、透明の四角形だけ）
-    portal_center_x = SPAWN_CENTER_WX
-    portal_center_y = SPAWN_CENTER_WY
-
     pw, ph = PORTAL_W, PORTAL_H
+    # セーブに座標があればそれを使う
+    if 'SAVED_PORTAL' in globals() and SAVED_PORTAL:
+        portal_center_x = int(SAVED_PORTAL.get("x", SPAWN_CENTER_WX))
+        portal_center_y = int(SAVED_PORTAL.get("y", SPAWN_CENTER_WY))
+    else:
+        portal_center_x = SPAWN_CENTER_WX
+        portal_center_y = SPAWN_CENTER_WY
+    
 
     # “上寄りで長め”の当たり判定
-    #   幅：portal と同じ
-    #   高さ：portal の 70%（お好みで 0.6～0.8 に）
-    #   位置：top は 画像の最上端（center_y - ph/2）に固定（=上に寄せる）
+    # 幅：portal と同じ
+    # 高さ：portal の 80%
+    # 位置：top は画像の上端から（上半分のみ有効）
     hit_h = int(ph * 0.80)
     collision_rect = pygame.Rect(
-        int(portal_center_x - pw / 2),   # 左上 x
-        int(portal_center_y - ph / 2),   # 左上 y（= 画像のトップ）
-        int(pw),                         # 幅
-        hit_h                            # 高さ（上寄りの長め当たり判定）
+        int(portal_center_x - pw / 2),
+        int(portal_center_y - ph / 2),  # 画像上端基準
+        int(pw),
+        hit_h
     )
 
     PORTALS = [{
@@ -2861,9 +2898,8 @@ while running:
         show_return_prompt = False
         pr = get_main_portal_rect()
         if pr.width > 0:
-            pcx, pcy = pr.center  # ★ ポータル中心座標を取得
-            # 中心から誤差±20以内（長方形判定でもOK・必要なら円距離に変えても可）
-            if abs(player_x - pcx) <= 60 and abs(player_y - pcy - 80) <= 20: #ポータル判定の誤差
+            vx, vy = get_portal_visual_center()
+            if math.hypot(player_x - vx, player_y - vy - 40) <= 60:
                 show_return_prompt = True
     
 
