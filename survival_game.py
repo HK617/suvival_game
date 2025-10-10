@@ -345,6 +345,7 @@ def save_game_data():
 def delete_save_data():
     global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
     global BG_RANDOM_SEED, EXPLORED_TILES
+    global SAVE_SNAPSHOT
 
     # 永続データを初期化
     persistent_attack_bonus = 1
@@ -352,6 +353,8 @@ def delete_save_data():
     persistent_maxhp_bonus  = 10
     persistent_exp_bonus    = 1
     battery = 0
+
+    SAVE_SNAPSHOT = None
 
     # 探索済みクリア
     EXPLORED_TILES.clear()
@@ -425,6 +428,82 @@ def enter_base_from_game():
     # ベースの背景スクロール位置も合わせてリセット
     base_bg_scroll_x = 0.0
     base_bg_scroll_y = 0.0
+#==========================
+# セーブスナップショット機能
+# ========================= 
+SAVE_SNAPSHOT = None  # 直近「プレイ開始前」の保存内容を保持
+
+def _build_save_dict():
+    """現在のゲーム状態を save_game_data() と同じ体裁の dict に組み立てて返す（書き込みはしない）"""
+    explored_str = ";".join(f"{gx},{gy}" for gx, gy in EXPLORED_TILES)
+    try:
+        blocks_compact_tiled = encode_blocks_tiled(TILED_BLOCKS)
+    except Exception:
+        blocks_compact_tiled = ""
+
+    return {
+        "persistent_attack_bonus": persistent_attack_bonus,
+        "persistent_speed_bonus":  persistent_speed_bonus,
+        "persistent_maxhp_bonus":  persistent_maxhp_bonus,
+        "persistent_exp_bonus":    persistent_exp_bonus,
+        "battery":                 battery,
+        "bg_seed":                 BG_RANDOM_SEED,
+        "explored_tiles":          explored_str,
+        "blocks_compact_tiled":    blocks_compact_tiled,
+    }
+
+def snapshot_savedata():
+    """プレイ開始前に呼ぶ：現在の savedata を丸ごとコピーして保持"""
+    global SAVE_SNAPSHOT
+    SAVE_SNAPSHOT = _build_save_dict()
+
+def _parse_explored_tiles(explored_str: str) -> set[tuple[int,int]]:
+    s = set()
+    if isinstance(explored_str, str):
+        for token in explored_str.split(";"):
+            token = token.strip()
+            if not token:
+                continue
+            gx_str, gy_str = token.split(",")
+            s.add((int(gx_str), int(gy_str)))
+    return s
+
+def restore_savedata_from_snapshot():
+    """Game Over 時に呼ぶ：スナップショットを savedata.json に書き戻し、メモリ上の配置も復元"""
+    global persistent_attack_bonus, persistent_speed_bonus, persistent_maxhp_bonus, persistent_exp_bonus, battery
+    global BG_RANDOM_SEED, EXPLORED_TILES, TILED_BLOCKS, border_blocks, CURRENT_PLAYER_TILE, SAVE_SNAPSHOT
+
+    if not SAVE_SNAPSHOT:
+        return  # 何も持っていなければ何もしない（初回など）
+
+    snap = SAVE_SNAPSHOT
+
+    # 1) ファイルへ書き戻し
+    try:
+        with open(SAVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+
+    # 2) メモリ上の状態もスナップショットへ合わせる
+    persistent_attack_bonus = int(snap.get("persistent_attack_bonus", persistent_attack_bonus))
+    persistent_speed_bonus  = int(snap.get("persistent_speed_bonus",  persistent_speed_bonus))
+    persistent_maxhp_bonus  = int(snap.get("persistent_maxhp_bonus",  persistent_maxhp_bonus))
+    persistent_exp_bonus    = float(snap.get("persistent_exp_bonus",  persistent_exp_bonus))
+    battery                 = int(snap.get("battery",                  battery))
+    BG_RANDOM_SEED          = int(snap.get("bg_seed",                  BG_RANDOM_SEED))
+
+    EXPLORED_TILES = _parse_explored_tiles(snap.get("explored_tiles", ""))
+    TILED_BLOCKS   = decode_blocks_tiled(snap.get("blocks_compact_tiled", "")) if snap.get("blocks_compact_tiled") else {}
+
+    # 3) 近傍3×3 のブロック参照を作り直す
+    try:
+        pgx, pgy = spawn_rel_tile(SPAWN_CENTER_WX or 5000, SPAWN_CENTER_WY or 5000)
+    except Exception:
+        pgx, pgy = (0, 0)
+    CURRENT_PLAYER_TILE = (pgx, pgy)
+    rebuild_border_blocks_around(pgx, pgy)
+
 
 # ===============================
 # ゲーム描画
@@ -1183,6 +1262,50 @@ PORTALS = []  # 各要素: {"rect": pygame.Rect(...)}
 def list_portals():
     return PORTALS
 
+#メインゲームからbaseへ
+def get_main_portal_rect() -> pygame.Rect:
+    """メインゲームのポータルRect（無ければ0サイズ）"""
+    if PORTALS and isinstance(PORTALS[0], dict):
+        return PORTALS[0].get("rect", pygame.Rect(0,0,0,0))
+    return pygame.Rect(0,0,0,0)
+
+# ドアの開閉
+def update_doors_by_distance(px: float, py: float, open_dist: float = 50.0):
+    """
+    プレイヤー座標(px, py) と各ドア『矩形』の距離で状態を更新。
+    - 矩形までの距離 <= open_dist なら 開く（非衝突・HP0）
+    - 距離 > open_dist なら 閉じる（衝突ON・HP復活）
+    """
+    changed = False
+    for br in border_blocks:
+        if br.get("door_state") is None:
+            continue  # 壁などは無視
+
+        # ★ここを変更：中心ではなく「矩形までの距離」で判定
+        dist = point_rect_distance(px, py, br["rect"])
+
+        if dist <= open_dist:
+            if br.get("door_state") != "open":
+                br["door_state"] = "open"
+                br["img"] = "open_door.png"
+                br["collidable"] = False
+                br["hp"] = br["max_hp"] = 0
+                changed = True
+        else:
+            if br.get("door_state") != "closed":
+                br["door_state"] = "closed"
+                br["img"] = "close_door.png"
+                br["collidable"] = True
+                br["hp"] = br["max_hp"] = DOOR_MAX_HP
+                changed = True
+
+    if changed:
+        try:
+            save_game_data()
+        except Exception:
+            pass
+
+
 # ===============================
 # ゲームリセット
 # ===============================
@@ -1204,6 +1327,8 @@ def reset_game():
 
     player_x, player_y = center_of_tile(0, 0, TILE_W, TILE_H)
     SPAWN_CENTER_WX, SPAWN_CENTER_WY = player_x, player_y
+
+    player_y += 100  # ★ スポーン後に少し上へずらす（ポータルの真上に出ないように）
 
     #ゲームスピード
     game_speed = 1.0
@@ -2097,6 +2222,8 @@ while running:
             screen.blit(tip, (tip_x, tip_y))
 
             if keys[pygame.K_f]:
+                # ★ プレイ開始前の savedata をスナップショット
+                snapshot_savedata()
                 reset_game()
                 in_base = False
 
@@ -2309,12 +2436,12 @@ while running:
                         confirm_gameover = False
                     elif event.key == pygame.K_y or event.key == pygame.K_RETURN:
                         # 確定→ゲームオーバーへ
-                        save_game_data()
+                        restore_savedata_from_snapshot() #ゲームを始める前の状態に戻す
                         confirm_gameover = False
                         game_over = True
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if yes_rect.collidepoint(event.pos):
-                        save_game_data()
+                        restore_savedata_from_snapshot() #ゲームを始める前の状態に戻す
                         confirm_gameover = False
                         game_over = True
                     elif no_rect.collidepoint(event.pos):
@@ -2703,6 +2830,48 @@ while running:
         if player_iframe > 0:
             player_iframe -= 1
 
+        #=======================================
+        # 建築物のアルゴリズム（動作）
+        #=======================================
+        # 予測位置（次フレームの判定に使う）
+        pred_x = player_x + dx + player_vx
+        pred_y = player_y + dy + player_vy
+
+        # ドア
+        # 距離でドア状態を更新（衝突判定より先）
+        update_doors_by_distance(pred_x, pred_y, open_dist=50) #ドアが開くまでの距離50
+
+        # ポータル
+        # === ポータル中心±20以内で base に戻るプロンプト ===
+        show_return_prompt = False
+        pr = get_main_portal_rect()
+        if pr.width > 0:
+            pcx, pcy = pr.center  # ★ ポータル中心座標を取得
+            # 中心から誤差±20以内（長方形判定でもOK・必要なら円距離に変えても可）
+            if abs(player_x - pcx) <= 20 and abs(player_y - pcy) <= 20:
+                show_return_prompt = True
+        
+        # ★ プレイヤーの“見た目位置”の下にテキストを出す（in_base と同じ感じ）
+        if show_return_prompt:
+            tip_font = jp_font(28)
+            tip = tip_font.render("baseに戻りますか？（Fキー）", True, (0, 0, 0))
+            # 画面中央にプレイヤーを描いているので、そこを基準に下側へ
+            tip_x = SCREEN_WIDTH // 2 - tip.get_width() // 2
+            # プレイヤー画像の下に少し余白を足して配置（お好みで調整）
+            tip_y = SCREEN_HEIGHT // 2 + player_original.get_height() // 2 + 40
+            screen.blit(tip, (tip_x, tip_y))
+
+            # Fキーで base に戻る
+            if pygame.key.get_pressed()[pygame.K_f]:
+                # 必要ならセーブ（お好み）
+                try:
+                    save_game_data()
+                except Exception:
+                    pass
+                enter_base_from_game()
+                # ここでこのフレームの描画を終わらせて戻ってOK
+    
+
         # 移動
         prev_x, prev_y = player_x, player_y
 
@@ -2713,21 +2882,12 @@ while running:
             if not br.get("collidable", True):
                 continue
             if test_rect_x.colliderect(br["rect"]):
-                # ★ 閉じたドアに当たったら即オープンして通す
-                if br.get("door_state") == "closed":
-                    br["door_state"] = "open"
-                    br["img"] = "open_door.png"
-                    br["collidable"] = False
-                    br["hp"] = br["max_hp"] = 0  # 開いたらHP表示なし
-                    try:
-                        save_game_data()
-                    except Exception:
-                        pass
-                    # ドアを開いたのでブロックとしては「当たり扱いしない」
-                    continue
-                # 通常の壁は止める
                 nx = prev_x
                 break
+
+        # ★ 追加：ポータル（画像の矩形）にも当たり判定
+        if test_rect_x.colliderect(get_main_portal_rect()):
+            nx = prev_x
 
         # ---- Y軸
         ny = prev_y + dy + player_vy
@@ -2736,19 +2896,12 @@ while running:
             if not br.get("collidable", True):
                 continue
             if test_rect_y.colliderect(br["rect"]):
-                # ★ 閉じたドアに当たったら即オープンして通す
-                if br.get("door_state") == "closed":
-                    br["door_state"] = "open"
-                    br["img"] = "open_door.png"
-                    br["collidable"] = False
-                    br["hp"] = br["max_hp"] = 0
-                    try:
-                        save_game_data()
-                    except Exception:
-                        pass
-                    continue
                 ny = prev_y
                 break
+        # ★ 追加：ポータル（画像の矩形）にも当たり判定
+        if test_rect_y.colliderect(get_main_portal_rect()):
+            ny = prev_y
+
 
         # 確定
         player_x, player_y = nx, ny
@@ -2765,20 +2918,6 @@ while running:
             int(player_y - PLAYER_COLL_H // 2),
             PLAYER_COLL_W, PLAYER_COLL_H
         )
-        # ★ ドア（閉）に触れたら“開く”：画像差し替え＆衝突OFF → ついでに保存
-        door_opened = False
-        for br in border_blocks:
-            if br.get("door_state") == "closed" and player_rect.colliderect(br["rect"]):
-                br["door_state"] = "open"
-                br["img"] = "open_door.png"
-                br["collidable"] = False
-                br["hp"] = br["max_hp"] = 0
-                door_opened = True
-        if door_opened:
-            try:
-                save_game_data()
-            except Exception:
-                pass
 
 
         # 向き変更
@@ -3214,6 +3353,7 @@ while running:
             dt["timer"] -= 1
             if dt["timer"] <= 0:
                 damage_texts.remove(dt)
+        
         #darw_game関数を呼び出す
         draw_game(screen)
         pygame.display.flip()
@@ -3222,7 +3362,7 @@ while running:
         # --- Game Over判定 ---
         if player_hp <= 0:
             game_over = True
-            save_game_data()#savedataに保存
+            restore_savedata_from_snapshot()  #ゲームを始める前の状態に戻す
             # このフレームはここまでにして、次ループで game_over=True の分岐へ移る
             continue
     elif game_clear:
