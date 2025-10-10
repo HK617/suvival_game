@@ -1173,7 +1173,7 @@ def draw_game(screen):
     battery_text = font.render(f"Battery: {battery}", True, (255, 255, 0))
     score_text = font.render(f"Score: {score}", True, (0, 255, 255))
     enemy_level_text = font.render(f"Enemy Lv: {enemy_level}", True, (255, 255, 255))
-    coord_text = font.render(f"X: {int(player_x - 5000)}  Y: {int(player_y - 5000)}", True, (0, 0, 0)) 
+    coord_text = font.render(f"X: {int(player_x - 5000)}  Y: {int(player_y - 5000) * -1}", True, (0, 0, 0)) #内部計算では、上がマイナス、下がプラスになっているので、座標表示時だけy座標の符号を反転して表示
     text_rect = coord_text.get_rect()
     text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 10)
 
@@ -2677,7 +2677,7 @@ while running:
             base_attack_text = font.render(f"base attack: {base_attack}", True, (0, 0, 0))
             clitical_rato_text = font.render(f"critical rato: {player_clitical_rato * 100} %", True, (0, 0, 0))
             clitical_damage_text = font.render(f"critical damage: × {player_clitical_damage}", True, (0, 0, 0))
-            coord_text = font.render(f"X: {player_x - 5000}  Y: {player_y - 5000}", True, (0, 0, 0))
+            coord_text = font.render(f"X: {int(player_x - 5000)}  Y: {int(player_y - 5000) * -1}", True, (0, 0, 0)) #内部計算では、上がマイナス、下がプラスになっているので、座標表示時だけy座標の符号を反転して表示
             text_rect = coord_text.get_rect()
             text_rect.bottomright = (SCREEN_WIDTH - 10, SCREEN_HEIGHT - 10)
 
